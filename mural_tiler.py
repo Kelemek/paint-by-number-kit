@@ -12,15 +12,22 @@ Writes to --out:
   mural.pdf         cover + placement map + numbered letter sheets (tracing templates at --scale)
   paint_areas.json  per-color hex, share and wall square feet (input for paint_math.py)
   preview.png       the color-reduced image at wall proportions
+
+With --preview-only also writes:
+  preview_kit.pdf      cover + placement map + sample letter sheets (same drawing as the full build)
+  preview_outlined.png whole mural with region outlines, numbers, and a faint sheet grid
+  preview_pages/       rasterized pages from preview_kit.pdf (when pdftoppm is available)
 """
 import argparse
 import json
 import math
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from reportlab.lib.colors import Color, HexColor, white
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.utils import ImageReader
@@ -98,7 +105,10 @@ def parse_args():
     p.add_argument("--brand", default="", help="paint brand name, used for labels only")
     p.add_argument("--palette-json", type=Path, help="brand matches keyed by color number (see brand_match.py)")
     p.add_argument("--scale", type=float, default=1.0, help="print scale; 1.0 = sheets are true wall size")
-    p.add_argument("--preview-only", action="store_true", help="write cover, map and areas but no sheets")
+    p.add_argument("--preview-only", action="store_true",
+                   help="write cover, map, areas and a rich preview (no full mural.pdf sheets)")
+    p.add_argument("--preview-sheets", type=int, default=2,
+                   help="with --preview-only, sample sheets in preview_kit.pdf (0 = map and outlined image only)")
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--no-face-priority", action="store_true",
                    help="disable automatic face priority (uniform min-region and palette)")
@@ -111,6 +121,8 @@ def parse_args():
         p.error("sizes, --scale, --min-region-in and coverage must be positive")
     if not 0 <= a.overlap_in < 2:
         p.error("--overlap-in must be between 0 and 2 inches")
+    if a.preview_sheets < 0:
+        p.error("--preview-sheets must be >= 0")
     if a.face_box:
         try:
             parse_face_box(a.face_box)
@@ -1283,6 +1295,190 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     return labeled
 
 
+# ---------- preview sampling & raster overview ----------
+
+def _sheet_work_rect(layout, r, c, k):
+    """Work-pixel axis-aligned bounds of a sheet tile (same as draw_sheet clipping)."""
+    sx0, sy0 = c * layout.step_x, r * layout.step_y
+    wx0, wy0 = sx0 / k, sy0 / k
+    wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
+    return wx0, wy0, wx1, wy1
+
+
+def _rect_intersection_area(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0)
+
+
+def _region_count_on_sheet(layout, r, c, k, regions):
+    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+    h, w = regions.shape
+    x0, y0 = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+    x1, y1 = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    crop = regions[y0:y1, x0:x1]
+    return len(np.unique(crop[crop > 0]))
+
+
+def _best_face_sheet(layout, face, k):
+    work_boxes = [tuple(f["work_box"]) for f in face.get("faces", []) if f.get("work_box")]
+    if not work_boxes:
+        return None
+    best = (-1.0, 0, 0)
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+            area = sum(_rect_intersection_area(*box, wx0, wy0, wx1, wy1) for box in work_boxes)
+            if area > best[0]:
+                best = (area, r, c)
+    if best[0] <= 0:
+        return None
+    return best[1], best[2], best[0]
+
+
+def _best_region_sheet(layout, k, regions):
+    best = (-1, 0, 0)
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            n = _region_count_on_sheet(layout, r, c, k, regions)
+            if n > best[0]:
+                best = (n, r, c)
+    return best[1], best[2], best[0]
+
+
+def pick_preview_sheets(preview_sheets, layout, regions, face, k):
+    """Return [(r, c, reason), ...] in render order, at most preview_sheets entries."""
+    if preview_sheets <= 0:
+        return []
+    picks = []
+    seen = set()
+
+    def add(r, c, reason):
+        if (r, c) in seen:
+            return
+        seen.add((r, c))
+        picks.append((r, c, reason))
+
+    face_pick = _best_face_sheet(layout, face, k) if face.get("found") else None
+    if face_pick:
+        r, c, area = face_pick
+        add(r, c, f"most face area on sheet ({area:.0f} work px²)")
+    else:
+        r, c, n = _best_region_sheet(layout, k, regions)
+        add(r, c, f"most regions ({n})")
+
+    add(0, 0, "top-left corner sheet")
+
+    if len(picks) < preview_sheets:
+        ranked = []
+        for r in range(layout.rows):
+            for c in range(layout.cols):
+                if (r, c) in seen:
+                    continue
+                ranked.append((-_region_count_on_sheet(layout, r, c, k, regions), r, c))
+        ranked.sort()
+        for _, r, c in ranked:
+            if len(picks) >= preview_sheets:
+                break
+            add(r, c, f"regions ({_region_count_on_sheet(layout, r, c, k, regions)})")
+    return picks[:preview_sheets]
+
+
+def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
+                          chunks, boxes, labels, regions, style, sample_sheets):
+    cv = Canvas(str(path), pagesize=letter, invariant=1, pageCompression=1)
+    cv.setTitle("Paint-by-number mural (preview)")
+    cover_pages, key_on_cover = draw_cover(cv, job, small, palette, areas, brand_map, layout)
+    if not key_on_cover:
+        draw_color_key_pages(cv, job, palette, areas, brand_map)
+    draw_map(cv, job, small, layout, mural_w, mural_h)
+    for r, c, _reason in sample_sheets:
+        draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
+                   palette, style)
+    cv.save()
+    return cover_pages
+
+
+def rasterize_pdf_pages(pdf_path, out_dir, dpi=120):
+    """Rasterize each PDF page to preview_pages/page-N.png; returns True if pages were written."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if shutil.which("pdftoppm") is None:
+        print("preview: pdftoppm not found; skipping rasterized preview_pages (install poppler-utils)")
+        return False
+    tmp = out_dir / "_ppm"
+    tmp.mkdir(parents=True, exist_ok=True)
+    prefix = tmp / "page"
+    try:
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(prefix)],
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"preview: pdftoppm failed ({e.stderr or e}); skipping preview_pages")
+        return False
+    pages = sorted(tmp.glob("page-*.png"))
+    for i, src in enumerate(pages, start=1):
+        dest = out_dir / f"page-{i}.png"
+        shutil.move(str(src), dest)
+    for leftover in tmp.glob("*"):
+        leftover.unlink(missing_ok=True)
+    tmp.rmdir()
+    return True
+
+
+def _outline_font(style):
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def draw_preview_outlined(path, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style):
+    """Whole-mural PNG with fills, vector boundaries, numbers, and a faint sheet grid."""
+    h, w = labels.shape
+    k = job["scale"] / job["ppi"]
+    base = Image.fromarray(palette[labels])
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    line_w = max(1, int(round(style.line_pt * job["ppi"] / 72 * 0.85)))
+    for chunk in chunks:
+        pts = [(float(x), float(y)) for x, y in chunk]
+        draw.line(pts, fill=(0, 0, 0, 210), width=line_w, joint="curve")
+
+    px_to_pt = k * PT * (w / max(mural_w * job["ppi"], 1))  # match sheet number sizing at mural width
+    placed, _ = place_numbers(labels, regions, px_to_pt, style)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    for x, y, text, size in placed:
+        pt = max(8, min(28, size * w / max(mural_w * job["ppi"], 1) * 0.55))
+        try:
+            font = ImageFont.truetype(font_path, int(round(pt)))
+        except OSError:
+            font = ImageFont.load_default()
+        tw, th = draw.textbbox((0, 0), text, font=font)[2:]
+        draw.text((x - tw / 2, y - th / 2), text, fill=(0, 0, 0, 235), font=font)
+
+    grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(grid)
+    label_font = _outline_font(style)
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+            x0, y0 = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+            x1, y1 = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+            gdraw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(120, 120, 120, 140), width=1)
+            sid = sheet_id(r, c)
+            gdraw.text((x0 + 4, y0 + 4), sid, fill=(31, 79, 191, 180), font=label_font)
+
+    out = Image.alpha_composite(base.convert("RGBA"), overlay)
+    out = Image.alpha_composite(out, grid)
+    out.convert("RGB").save(path, optimize=True)
+
+
 # ---------- main ----------
 
 def load_brand_map(path, n_colors):
@@ -1375,20 +1571,41 @@ def main():
     draw_map(cv, job, small, layout, mural_w, mural_h)
     front_pages = cover_pages + key_pages + 1  # cover + optional key pages + placement map
     labeled = set()
+    chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=max(2.0, 0.1 * ppi)))
     if not a.preview_only:
-        chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=max(2.0, 0.1 * ppi)))
         for r in range(layout.rows):
             for c in range(layout.cols):
                 labeled |= draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
                                       palette, style)
     cv.save()
 
+    preview_samples = []
+    if a.preview_only:
+        k_sheet = job["scale"] / job["ppi"]
+        preview_samples = pick_preview_sheets(a.preview_sheets, layout, regions, face, k_sheet)
+        kit_pdf = a.out / "preview_kit.pdf"
+        build_preview_kit_pdf(kit_pdf, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
+                              chunks, boxes, labels, regions, style, preview_samples)
+        outlined = a.out / "preview_outlined.png"
+        draw_preview_outlined(outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style)
+        pages_dir = a.out / "preview_pages"
+        rasterize_pdf_pages(kit_pdf, pages_dir)
+        print(f"preview: {a.out / 'preview.png'}")
+        print(f"preview: {outlined}")
+        print(f"preview: {kit_pdf}")
+        if pages_dir.is_dir() and any(pages_dir.glob("page-*.png")):
+            print(f"preview: {pages_dir}/page-*.png")
+        for r, c, reason in preview_samples:
+            print(f"preview sheet {sheet_id(r, c)} (row {r + 1}, col {c + 1}): {reason}")
+        print(f"full build will use {layout.count} sheets ({layout.cols}x{layout.rows} "
+              f"{'landscape' if layout.landscape else 'portrait'})")
+
     summary = {
         "wall_width_ft": a.wall_width_ft, "wall_height_ft": a.wall_height_ft, "wall_sqft": round(wall_sqft, 2),
         "coats": a.coats, "coverage_sqft_per_gal": a.coverage_sqft_per_gal, "brand": a.brand,
         "requested_colors": a.colors, "colors_used": n, "transfer": a.transfer, "scale": a.scale,
         "fit": fit_note, "work_px_per_wall_in": round(ppi, 2), "min_region_in": a.min_region_in,
-        "sheets": {"count": 0 if a.preview_only else layout.count, "rows": layout.rows, "cols": layout.cols,
+        "sheets": {"count": layout.count, "rows": layout.rows, "cols": layout.cols,
                    "orientation": "landscape" if layout.landscape else "portrait", "overlap_in": a.overlap_in},
         "regions": int(regions.max()),
         "front_pages": front_pages,
@@ -1411,8 +1628,9 @@ def main():
         summary["unlabeled_regions"] = int(regions.max()) - len(labeled)
     (a.out / "paint_areas.json").write_text(json.dumps(summary, indent=2) + "\n")
     pdf_mb = (a.out / "mural.pdf").stat().st_size / 1e6
+    sheet_note = f"{layout.count} sheets" if a.preview_only else f"{summary['sheets']['count']} sheets"
     print(f"{n} colors ({a.colors} requested), {summary['regions']} regions, "
-          f"{summary['sheets']['count']} sheets {layout.cols}x{layout.rows} {summary['sheets']['orientation']}, "
+          f"{sheet_note} {layout.cols}x{layout.rows} {summary['sheets']['orientation']}, "
           f"{pdf_mb:.1f} MB -> {a.out / 'mural.pdf'}")
     if summary.get("unlabeled_regions"):
         print(f"warning: {summary['unlabeled_regions']} regions got no number on any sheet")
