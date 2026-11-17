@@ -19,7 +19,7 @@ from scripts.focal_quality import audit_job, audit_legibility  # noqa: E402
 from scripts.rembrandt_focal_verify import SIZES, analyze_dir, build_grid, crop_box, print_row, save_under_mb  # noqa: E402
 
 CASES = [
-    ("kitten", ROOT / "test_assets" / "kitten_ragdoll_canvas.jpg", "kitten", "", (10 / 12, 8 / 12)),
+    ("kitten", ROOT / "test_assets" / "kitten_ragdoll_canvas.jpg", "kitten", "", (8 / 12, 10 / 12)),
     ("rembrandt", ROOT / "test_assets" / "rembrandt_1634.jpg", "rembrandt", "", (8, 6)),
     ("cat", ROOT / "test_assets" / "cat_pexels.jpg", "cat_pexels", "", (8, 6)),
     ("dog", ROOT / "test_assets" / "dog_wikimedia.jpg", "dog_wikimedia", "", (8, 6)),
@@ -78,7 +78,7 @@ def main():
             return 1
         extra = ["--subject-box", subject_box] if subject_box else None
         is_canvas = slug == "kitten"
-        w_run, h_run = ((10 / 12, 8 / 12) if is_canvas else (wall_w, wall_h))
+        w_run, h_run = ((8 / 12, 10 / 12) if is_canvas else (wall_w, wall_h))
         levels = list(DETAIL_LEVELS) if is_canvas else ["medium"]
         for level in levels:
             tag = f"{name}_{level}_{'canvas' if is_canvas else 'wall'}"
