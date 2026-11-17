@@ -199,24 +199,33 @@ def trace_sigma(ppi, min_region_in, face=None):
     return min(raw, cap)
 
 
-def label_metrics(labels, regions, face_mask, eye_mask):
+def label_metrics(labels, regions, face_mask, eye_mask, mouth_mask=None):
     n_reg = int(regions.max())
     face_pix = float((face_mask >= 0.35).sum()) if face_mask is not None else 0.0
     eye_pix = float((eye_mask >= 0.35).sum()) if eye_mask is not None else 0.0
-    face_regs, eye_regs = set(), set()
+    mouth_pix = float((mouth_mask >= 0.35).sum()) if mouth_mask is not None else 0.0
+    bg_pix = float(labels.size - (face_mask >= 0.35).sum()) if face_mask is not None else float(labels.size)
+    face_regs, eye_regs, mouth_regs, bg_regs = set(), set(), set(), set()
     if face_pix:
         face_regs = set(np.unique(regions[face_mask >= 0.35]).tolist()) - {0}
     if eye_pix:
         eye_regs = set(np.unique(regions[eye_mask >= 0.35]).tolist()) - {0}
+    if mouth_pix:
+        mouth_regs = set(np.unique(regions[mouth_mask >= 0.35]).tolist()) - {0}
+    if face_mask is not None:
+        bg_regs = set(np.unique(regions[face_mask < 0.35]).tolist()) - {0}
     return {
         "regions": n_reg,
         "face_regions": len(face_regs),
         "eye_regions": len(eye_regs),
+        "mouth_regions": len(mouth_regs),
+        "background_regions": len(bg_regs),
         "face_regions_per_10k_px": round(len(face_regs) / face_pix * 10_000, 2) if face_pix else 0.0,
+        "background_regions_per_10k_px": round(len(bg_regs) / bg_pix * 10_000, 2) if bg_pix else 0.0,
     }
 
 
-def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask):
+def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask, mouth_mask=None):
     argv = {
         "image": str(a.image) if a.image else None,
         "wall_width_ft": a.wall_width_ft,
@@ -229,7 +238,9 @@ def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box,
         "transfer": a.transfer,
         "brand": a.brand,
         "scale": a.scale,
+        "no_subject_priority": a.no_subject_priority,
         "no_face_priority": a.no_face_priority,
+        "subject_box": a.subject_box,
         "face_box": a.face_box,
         "detail": a.detail,
         "prep": resolved.get("prep"),
@@ -247,8 +258,9 @@ def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box,
         "crop_box": list(crop_box),
         "ppi": resolved["ppi"],
         "fit_note": resolved["fit_note"],
-        "face_priority": {k: v for k, v in face.items() if k not in ("mask", "eye_mask")},
-        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask),
+        "subject_priority": _subject_meta_for_json(face),
+        "face_priority": _subject_meta_for_json(face),
+        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask, mouth_mask),
     }
     (out / PREVIEW_JOB_NAME).write_text(json.dumps(meta, indent=2) + "\n")
     npz = {k: arr for k, arr in (
@@ -260,6 +272,8 @@ def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box,
         npz["face_mask"] = face_mask.astype(np.float32)
     if eye_mask is not None:
         npz["eye_mask"] = eye_mask.astype(np.float32)
+    if mouth_mask is not None:
+        npz["mouth_mask"] = mouth_mask.astype(np.float32)
     np.savez_compressed(out / LABELS_ARCHIVE, **npz)
 
 
@@ -273,7 +287,8 @@ def load_saved_labels(from_dir):
     regions = data["regions"]
     face_mask = data["face_mask"] if "face_mask" in data else None
     eye_mask = data["eye_mask"] if "eye_mask" in data else None
-    return labels, palette, regions, face_mask, eye_mask
+    mouth_mask = data["mouth_mask"] if "mouth_mask" in data else None
+    return labels, palette, regions, face_mask, eye_mask, mouth_mask
 
 
 def parse_args():
@@ -304,11 +319,23 @@ def parse_args():
     p.add_argument("--preview-sheets", type=int, default=2,
                    help="with --preview-only, sample sheets in preview_kit.pdf (0 = map and outlined image only)")
     p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--no-subject-priority", action="store_true",
+                   help="disable automatic subject priority for faces and animals (uniform detail)")
     p.add_argument("--no-face-priority", action="store_true",
-                   help="disable automatic face priority (uniform min-region and palette)")
+                   help="alias for --no-subject-priority")
+    p.add_argument("--subject-box", default="",
+                   help="manual subject box in source pixels (after EXIF): x0,y0,x1,y1")
     p.add_argument("--face-box", default="",
-                   help="manual face box in source pixels (after EXIF transpose): x0,y0,x1,y1")
+                   help="alias for --subject-box when the subject is a person")
     a = p.parse_args()
+    if a.no_face_priority:
+        a.no_subject_priority = True
+    if a.no_subject_priority:
+        a.no_face_priority = True
+    box = (a.subject_box or a.face_box).strip()
+    a.subject_box = box
+    if box and not a.face_box:
+        a.face_box = box
     a._from_preview_dir = None
     if a.from_preview:
         merge_from_preview_args(a, p)
@@ -330,30 +357,58 @@ def parse_args():
         p.error("--overlap-in must be between 0 and 2 inches")
     if a.preview_sheets < 0:
         p.error("--preview-sheets must be >= 0")
-    if a.face_box:
+    if box:
         try:
-            parse_face_box(a.face_box)
+            parse_subject_box(box)
         except ValueError as e:
-            p.error(f"--face-box: {e}")
+            p.error(f"--subject-box: {e}")
     return a
 
 
-# ---------- face priority ----------
+def subject_priority_off(args):
+    return bool(getattr(args, "no_subject_priority", False) or args.no_face_priority)
+
+
+def manual_subject_box(args):
+    return (getattr(args, "subject_box", "") or args.face_box or "").strip()
+
+
+def parse_subject_box(text):
+    return parse_face_box(text)
+
+
+# ---------- subject priority (human faces + animal focal subjects) ----------
 
 YUNET_MODEL = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
+YOLOX_MODEL = Path(__file__).resolve().parent / "models" / "object_detection_yolox_2022nov.onnx"
+CAT_FACE_CASCADE = Path(__file__).resolve().parent / "models" / "haarcascade_frontalcatface.xml"
+YOLOX_SCORE = 0.45
+YOLOX_NMS = 0.5
+YOLOX_OBJ = 0.45
+COCO_CLASS_NAMES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus",
+    "train", "truck", "boat", "traffic light", "fire hydrant",
+    "stop sign", "parking meter", "bench", "bird", "cat", "dog",
+    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+)
+ANIMAL_CLASS_IDS = frozenset(range(14, 24))  # bird .. giraffe
 FACE_PAD = 1.6                 # expand detector box to include hairline, ears, beard/chin
 FACE_EXTRA_TOP = 0.10          # extra height upward (hair / ears), as a fraction of the padded box
-FACE_COLOR_SHARE = 0.40        # share of the color budget reserved from face pixels
 FACE_MIN_COLORS = 4            # at least this many reserved tones (Low needs 4)
 FACE_REGION_FRAC = 0.30        # face min-region is this fraction of the level's --min-region-in
 FACE_REGION_FLOOR_IN = 0.12    # still paintable with a small brush on a canvas
+BG_REGION_MULT = 1.35          # background merges more aggressively than the global min-region
 YUNET_SCORE = 0.6
 FACE_FEATHER = 0.18            # soft edge as a fraction of box size, so no hard rectangle
 EYE_RADIUS_FRAC = 0.55         # eye-box radius as a fraction of inter-eye distance (covers lens + frame)
 EYE_FEATHER = 0.22             # soft disk edge, as a fraction of the radius
 EYE_COLORS = 3                 # floor reserved from eye pixels once N>=10 (pupil/iris, white/lens, frame); scales up with N, cap 8
-EYE_REGION_FRAC = 0.40         # eye min-region is this fraction of the face min-region
-EYE_REGION_FLOOR_IN = 0.08     # still label-able with a small number on a canvas
+EYE_REGION_FRAC = 0.22         # eye min-region is this fraction of the face min-region
+EYE_REGION_FLOOR_IN = 0.06     # still label-able with a small number on a canvas
+MOUTH_COLORS = 2               # floor for lip shadow / mouth opening tones
+MOUTH_REGION_FRAC = 0.25
+MOUTH_REGION_FLOOR_IN = 0.06
+MOUTH_FEATHER = 0.24
 
 
 def parse_face_box(text):
@@ -413,8 +468,248 @@ def _detect_faces_yunet(rgb_img):
             "box": (x * inv, y * inv, (x + fw) * inv, (y + fh) * inv),
             "score": score,
             "landmarks": lms,
+            "class_id": None,
+            "class_name": "person",
+            "subject_type": "human",
         })
     return out
+
+
+class _YoloXDetector:
+    """Minimal OpenCV-Zoo YOLOX wrapper (Apache-2.0)."""
+
+    def __init__(self, model_path):
+        import cv2
+
+        self._cv2 = cv2
+        self.net = cv2.dnn.readNet(str(model_path))
+        self.input_size = (640, 640)
+        self.strides = [8, 16, 32]
+        self.conf_threshold = YOLOX_SCORE
+        self.nms_threshold = YOLOX_NMS
+        self._generate_anchors()
+
+    def _generate_anchors(self):
+        grids, expanded = [], []
+        for stride in self.strides:
+            hsize = self.input_size[0] // stride
+            wsize = self.input_size[1] // stride
+            xv, yv = np.meshgrid(np.arange(wsize), np.arange(hsize))
+            grid = np.stack((xv, yv), 2).reshape(1, -1, 2)
+            grids.append(grid)
+            expanded.append(np.full((1, hsize * wsize, 1), stride, dtype=np.float32))
+        self.grids = np.concatenate(grids, 1)
+        self.expanded_strides = np.concatenate(expanded, 1)
+
+    def infer(self, letterboxed_rgb):
+        blob = np.transpose(letterboxed_rgb, (2, 0, 1))[np.newaxis, :, :, :]
+        self.net.setInput(blob)
+        outs = self.net.forward(self.net.getUnconnectedOutLayersNames())
+        dets = outs[0][0]
+        dets[:, :2] = (dets[:, :2] + self.grids) * self.expanded_strides
+        dets[:, 2:4] = np.exp(dets[:, 2:4]) * self.expanded_strides
+        boxes = dets[:, :4]
+        boxes_xywh = np.ones_like(boxes)
+        boxes_xywh[:, 0] = boxes[:, 0] - boxes[:, 2] / 2.0
+        boxes_xywh[:, 1] = boxes[:, 1] - boxes[:, 3] / 2.0
+        boxes_xywh[:, 2] = boxes[:, 2]
+        boxes_xywh[:, 3] = boxes[:, 3]
+        scores = dets[:, 4:5] * dets[:, 5:]
+        max_scores = np.amax(scores, axis=1)
+        max_scores_idx = np.argmax(scores, axis=1)
+        keep = self._cv2.dnn.NMSBoxesBatched(
+            boxes_xywh.tolist(), max_scores.tolist(), max_scores_idx.tolist(),
+            self.conf_threshold, self.nms_threshold,
+        )
+        candidates = np.concatenate([boxes_xywh, max_scores[:, None], max_scores_idx[:, None]], axis=1)
+        if len(keep) == 0:
+            return np.zeros((0, 6))
+        return candidates[keep]
+
+
+_yolox_singleton = None
+
+
+def _yolox_detector():
+    global _yolox_singleton
+    if _yolox_singleton is not None:
+        return _yolox_singleton
+    if not YOLOX_MODEL.is_file():
+        return None
+    try:
+        _yolox_singleton = _YoloXDetector(YOLOX_MODEL)
+    except Exception:
+        return None
+    return _yolox_singleton
+
+
+def _yolox_letterbox(rgb, target=(640, 640)):
+    import cv2
+
+    padded = np.ones((target[0], target[1], 3), dtype=np.float32) * 114.0
+    h, w = rgb.shape[:2]
+    ratio = min(target[0] / h, target[1] / w)
+    resized = cv2.resize(rgb, (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    padded[: resized.shape[0], : resized.shape[1]] = resized
+    return padded, ratio
+
+
+def _detect_animals_yolox(rgb_img):
+    det = _yolox_detector()
+    if det is None:
+        return []
+    try:
+        import cv2
+    except ImportError:
+        return []
+    arr = np.asarray(rgb_img)
+    padded, ratio = _yolox_letterbox(arr)
+    preds = det.infer(padded)
+    if preds is None or len(preds) == 0:
+        return []
+    out = []
+    inv = 1.0 / ratio
+    for row in preds:
+        x, y, w, h, score, cls_id = (float(row[i]) for i in range(6))
+        cls_id = int(cls_id)
+        if cls_id not in ANIMAL_CLASS_IDS or score < YOLOX_SCORE:
+            continue
+        x0, y0, x1, y1 = x * inv, y * inv, (x + w) * inv, (y + h) * inv
+        name = COCO_CLASS_NAMES[cls_id] if cls_id < len(COCO_CLASS_NAMES) else str(cls_id)
+        out.append({
+            "box": (x0, y0, x1, y1),
+            "score": score,
+            "landmarks": [],
+            "class_id": cls_id,
+            "class_name": name,
+            "subject_type": "animal",
+        })
+    return out
+
+
+def _pick_primary_animal(detections):
+    best, best_key = None, -1.0
+    for det in detections:
+        x0, y0, x1, y1 = det["box"]
+        area = max(1.0, (x1 - x0) * (y1 - y0))
+        key = float(det["score"]) * math.sqrt(area)
+        if key > best_key:
+            best_key = key
+            best = det
+    return [best] if best else []
+
+
+def _detection_strength(det):
+    x0, y0, x1, y1 = det["box"]
+    area = max(1.0, (x1 - x0) * (y1 - y0))
+    return float(det["score"]) * math.sqrt(area)
+
+
+def _prefer_animal_over_human(humans, animals):
+    """YuNet sometimes fires on animal fur; prefer YOLOX when it is stronger."""
+    if not animals:
+        return False
+    if not humans:
+        return True
+    h = max(humans, key=lambda d: d["score"])
+    a = _pick_primary_animal(animals)[0]
+    if h["score"] >= 0.92 and a["score"] < 0.65:
+        return False
+    if h["score"] < 0.78:
+        return True
+    return _detection_strength(a) > _detection_strength(h) * 0.88
+
+
+def _animal_head_box(animal_box, class_name):
+    x0, y0, x1, y1 = animal_box
+    bw, bh = x1 - x0, y1 - y0
+    if class_name == "bird":
+        frac = 0.42
+    else:
+        frac = 0.58
+    return (x0, y0, x0 + bw, y0 + frac * bh)
+
+
+def _refine_cat_head_box(src, animal_box):
+    fallback = _animal_head_box(animal_box, "cat")
+    if not CAT_FACE_CASCADE.is_file():
+        return fallback, False
+    try:
+        import cv2
+    except ImportError:
+        return fallback, False
+    if not hasattr(cv2, "CascadeClassifier"):
+        return fallback, False
+    arr = np.asarray(src)[:, :, ::-1]
+    cascade = cv2.CascadeClassifier(str(CAT_FACE_CASCADE))
+    x0, y0, x1, y1 = (int(v) for v in animal_box)
+    x0, y0 = max(0, x0), max(0, y0)
+    roi = arr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return fallback, False
+    faces = cascade.detectMultiScale(roi, scaleFactor=1.08, minNeighbors=3, minSize=(24, 24))
+    if len(faces) == 0:
+        return fallback, False
+    fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+    hx0, hy0 = x0 + fx, y0 + fy
+    hx1, hy1 = hx0 + fw, hy0 + fh
+    pad = 0.35
+    cx, cy = (hx0 + hx1) / 2, (hy0 + hy1) / 2
+    bw, bh = (hx1 - hx0) * (1 + pad), (hy1 - hy0) * (1 + pad)
+    return (cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2), True
+
+
+def _eye_disks_from_contrast(rgb_img, head_box, img_w, img_h):
+    x0, y0, x1, y1 = (int(v) for v in head_box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(img_w, x1), min(img_h, y1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return []
+    arr = np.asarray(rgb_img)[y0:y1, x0:x1]
+    hh, ww = arr.shape[:2]
+    upper_h = max(4, int(hh * 0.55))
+    disks = []
+    for x_lo, x_hi in ((0, ww // 2), (ww // 2, ww)):
+        patch = arr[:upper_h, x_lo:x_hi]
+        if patch.size < 40:
+            continue
+        lab = rgb_to_lab(patch.reshape(-1, 3))[:, 0].reshape(patch.shape[:2])
+        cut = np.percentile(lab, 12)
+        mask = lab <= cut + 2.0
+        if mask.sum() < 12:
+            continue
+        ys, xs = np.nonzero(mask)
+        cx = float(xs.mean() + x_lo + x0)
+        cy = float(ys.mean() + y0)
+        r = max(3.0, min(patch.shape[0], patch.shape[1]) * 0.14)
+        disks.append((cx, cy, r))
+    return disks
+
+
+def _muzzle_ellipse_animal(head_box):
+    x0, y0, x1, y1 = head_box
+    bw, bh = x1 - x0, y1 - y0
+    cx, cy = (x0 + x1) / 2, y0 + 0.76 * bh
+    return (cx, cy, 0.24 * bw, 0.15 * bh)
+
+
+def _empty_subject_info(args):
+    enabled = not subject_priority_off(args)
+    return {
+        "enabled": enabled, "found": False, "subject_type": None, "subject_class": None,
+        "detector": "none", "detectors": [],
+        "detections": [], "faces": [],
+        "mask": None, "face_min_region_in": None, "face_colors_reserved": 0,
+        "eye_mask": None, "eye_min_region_in": None, "eye_colors_reserved": 0,
+        "eye_count": 0, "eye_disks_work": [],
+        "mouth_mask": None, "mouth_min_region_in": None, "mouth_colors_reserved": 0,
+        "face_skin_colors": 0, "background_colors_reserved": 0,
+        "mouth_ellipses_work": [],
+    }
+
+
+def _subject_meta_for_json(subject):
+    return {k: v for k, v in subject.items() if k not in ("mask", "eye_mask", "mouth_mask")}
 
 
 def _map_box_to_work(src_box, crop_box, work_size):
@@ -499,7 +794,7 @@ def _maybe_upscale_ppi(src, wall_w_in, wall_h_in, ppi, enabled):
     max_ppi = math.sqrt(MAX_WORK_PIXELS / (wall_w_in * wall_h_in))
     bumped = min(TARGET_PPI * 2, src_ppi * 2, max_ppi)
     if bumped > ppi * 1.15:
-        print(f"face priority: work resolution {bumped:.1f} px/in "
+        print(f"subject priority: work resolution {bumped:.1f} px/in "
               f"(Lanczos upscale; source is {src_ppi:.1f} px/in)")
         return bumped
     return ppi
@@ -526,109 +821,232 @@ def _soft_mask(h, w, boxes, feather=FACE_FEATHER):
     return np.clip(mask, 0, 1)
 
 
-def _eye_color_count(n, n_face):
-    """Reserve 2-3 eye colors at Low, more at High/Photo, always within the same total N."""
+def face_palette_share(detail):
+    return {"low": 0.50, "medium": 0.55, "high": 0.56, "photo": 0.58}.get(detail or "medium", 0.55)
+
+
+def feature_color_budget(n, detail):
+    """Split total N among bg, face skin, eyes, and mouth (face+focal takes 50-58%)."""
+    n_face_total = min(n - 3, max(FACE_MIN_COLORS, int(round(n * face_palette_share(detail)))))
     if n < 6:
-        return 0
+        return n_face_total, 0, 0, max(1, n - n_face_total)
     if n < 10:
-        want = 2
+        n_eye, n_mouth = 2, 1
     else:
-        # Low 10 -> 3, Medium 20 -> 4, High 35 -> 7, Photo 60 -> 8 (cap)
-        want = min(8, max(EYE_COLORS, int(round(n * 0.20))))
-    return min(want, max(0, n - n_face - 2))
+        n_eye = min(8, max(EYE_COLORS, int(round(n * 0.18))))
+        n_mouth = min(5, max(MOUTH_COLORS, int(round(n * 0.08))))
+    n_eye = min(n_eye, max(0, n_face_total - 2))
+    n_mouth = min(n_mouth, max(0, n_face_total - n_eye - 1))
+    n_skin = max(1, n_face_total - n_eye - n_mouth)
+    n_bg = max(2, n - n_face_total)
+    return n_skin, n_eye, n_mouth, n_bg
 
 
-def resolve_faces(src, work_img, crop_box, args):
+def _mouth_ellipse_from_landmarks(landmarks, img_w, img_h):
+    if not landmarks or len(landmarks) < 5:
+        return None
+    rm, lm, nose = landmarks[3], landmarks[4], landmarks[2]
+    cx, cy = (rm[0] + lm[0]) / 2, (rm[1] + lm[1]) / 2
+    mouth_w = math.hypot(lm[0] - rm[0], lm[1] - rm[1])
+    if mouth_w < 6:
+        return None
+    cy += 0.12 * mouth_w
+    rx, ry = max(6.0, 0.72 * mouth_w), max(4.0, 0.38 * mouth_w)
+    return (cx, cy, rx, ry)
 
-    """Detect or apply a manual face box. Returns a dict; mask is None when face priority is off or no face is found."""
-    info = {"enabled": not args.no_face_priority, "found": False, "detector": "none",
-            "faces": [], "mask": None, "face_min_region_in": None, "face_colors_reserved": 0,
-            "eye_mask": None, "eye_min_region_in": None, "eye_colors_reserved": 0,
-            "eye_count": 0, "eye_disks_work": []}
-    if args.no_face_priority:
-        print("face priority: off")
+
+def _estimate_mouth_ellipse(face_box):
+    x0, y0, x1, y1 = face_box
+    bw, bh = x1 - x0, y1 - y0
+    cx, cy = (x0 + x1) / 2, y0 + 0.72 * bh
+    return (cx, cy, 0.28 * bw, 0.14 * bh)
+
+
+def _soft_ellipse(h, w, cx, cy, rx, ry, feather=MOUTH_FEATHER):
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    nx = (xx - cx) / max(rx, 1.0)
+    ny = (yy - cy) / max(ry, 1.0)
+    d = np.sqrt(nx * nx + ny * ny)
+    inner = 1.0 - feather
+    ramp = np.where(
+        d <= inner, 1.0,
+        np.where(d >= 1.0, 0.0, 0.5 - 0.5 * np.cos(np.clip((1.0 - d) / feather, 0, 1) * np.pi)),
+    )
+    return np.clip(ramp.astype(np.float32), 0, 1)
+
+
+def _dark_lab_slots(pixels, count, percentile=12):
+    """Pick Lab centers from the darkest pixels (not means), for pupils and mouth shadow."""
+    if len(pixels) == 0 or count <= 0:
+        return np.zeros((0, 3))
+    lab = rgb_to_lab(pixels)
+    l = lab[:, 0]
+    cut = np.percentile(l, percentile)
+    dark = pixels[l <= cut + 1.5]
+    if len(dark) < count:
+        dark = pixels[np.argsort(l)[: max(count * 3, count)]]
+    slots = []
+    for i in range(count):
+        chunk = dark[i::count] if len(dark) >= count else dark
+        if len(chunk) == 0:
+            continue
+        pick = chunk[np.argmin(rgb_to_lab(chunk)[:, 0])]
+        if all(np.linalg.norm(rgb_to_lab(pick) - rgb_to_lab(s)) >= 1.2 for s in slots):
+            slots.append(rgb_to_lab(pick))
+    return np.array(slots) if slots else np.zeros((0, 3))
+
+
+def resolve_subject(src, work_img, crop_box, args):
+    """Detect a focal human or animal subject and build face/eye/mouth (muzzle) priority masks."""
+    info = _empty_subject_info(args)
+    if subject_priority_off(args):
+        print("subject priority: off")
         return info
     src_w, src_h = src.size
     work_w, work_h = work_img.size
-    detections, detector = [], "none"
-    if args.face_box:
-        detections = [{"box": parse_face_box(args.face_box), "score": 1.0, "landmarks": []}]
+    detectors = []
+    detections, detector, subject_type, subject_class = [], "none", None, None
+    manual = manual_subject_box(args)
+    if manual:
+        detections = [{
+            "box": parse_subject_box(manual), "score": 1.0, "landmarks": [],
+            "class_id": None, "class_name": "person", "subject_type": "human",
+        }]
         detector = "manual"
+        subject_type, subject_class = "human", "person"
+        detectors.append("manual")
     else:
-        detections = _detect_faces_yunet(src)
-        if detections:
-            detector = "yunet"
+        humans = _detect_faces_yunet(src)
+        animals = _detect_animals_yolox(src)
+        if animals and _prefer_animal_over_human(humans, animals):
+            detections = _pick_primary_animal(animals)
+            det = detections[0]
+            detector, subject_type, subject_class = "yolox", "animal", det["class_name"]
+            detectors.append("yolox")
+        elif humans:
+            detections = humans
+            detector, subject_type, subject_class = "yunet", "human", "person"
+            detectors.append("yunet")
     if not detections:
-        print("face priority: no face found; using uniform detail")
+        print("subject priority: no human face or focal animal found; using uniform detail")
         return info
-    # Keep the strongest face(s). Drop a weaker detection whose center sits inside
-    # a higher-scoring padded box (a cat's chest, a highlight) so group photos still
-    # keep two clearly separate faces.
     ranked = sorted(detections, key=lambda d: -d["score"])
-    kept, kept_padded = [], []
+    kept, kept_padded, kept_heads = [], [], []
     for det in ranked:
         box = det["box"]
         cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
         if any(px0 <= cx <= px1 and py0 <= cy <= py1 for px0, py0, px1, py1 in kept_padded):
             continue
-        padded = _pad_box(box, src_w, src_h)
+        if det.get("subject_type") == "animal":
+            head = det["box"]
+            if det.get("class_name") == "cat":
+                head, used_haar = _refine_cat_head_box(src, det["box"])
+                if used_haar and "cat_haar" not in detectors:
+                    detectors.append("cat_haar")
+            else:
+                head = _animal_head_box(det["box"], det.get("class_name") or "dog")
+            padded = _pad_box(head, src_w, src_h, scale=1.25, extra_top=0.06)
+        else:
+            head = box
+            padded = _pad_box(box, src_w, src_h)
         kept.append(det)
         kept_padded.append(padded)
-    work_boxes, faces_meta, eye_disks_work = [], [], []
-    for det, padded in zip(kept, kept_padded):
+        kept_heads.append(head)
+    work_boxes, subjects_meta, eye_disks_work, mouth_ellipses_work = [], [], [], []
+    scale_x = work_w / (crop_box[2] - crop_box[0])
+    scale_y = work_h / (crop_box[3] - crop_box[1])
+    for det, padded, head in zip(kept, kept_padded, kept_heads):
         mapped = _map_box_to_work(padded, crop_box, (work_w, work_h))
         lms = det.get("landmarks") or []
         lms_work = [_map_point_to_work(x, y, crop_box, (work_w, work_h)) for x, y in lms] if lms else []
-        disks_src = _eye_disks_from_landmarks(lms, src_w, src_h) if lms else []
-        if not disks_src:
-            disks_src = _estimate_eye_disks(padded)
+        if det.get("subject_type") == "animal":
+            disks_src = _eye_disks_from_contrast(src, head, src_w, src_h)
+            if not disks_src:
+                disks_src = _estimate_eye_disks(head)
+            mouth_src = _muzzle_ellipse_animal(head)
+        else:
+            disks_src = _eye_disks_from_landmarks(lms, src_w, src_h) if lms else []
+            if not disks_src:
+                disks_src = _estimate_eye_disks(padded)
+            mouth_src = _mouth_ellipse_from_landmarks(lms, src_w, src_h) if lms else _estimate_mouth_ellipse(padded)
         for cx, cy, r in disks_src:
             wcx, wcy = _map_point_to_work(cx, cy, crop_box, (work_w, work_h))
-            wr = r * (work_w / (crop_box[2] - crop_box[0]))
+            wr = r * scale_x
             if wr >= 2:
                 eye_disks_work.append((wcx, wcy, wr))
-        faces_meta.append({
+        if mouth_src:
+            wcx, wcy = _map_point_to_work(mouth_src[0], mouth_src[1], crop_box, (work_w, work_h))
+            mouth_ellipses_work.append((wcx, wcy, mouth_src[2] * scale_x, mouth_src[3] * scale_y))
+        meta = {
             "source_box": [round(v, 1) for v in det["box"]],
+            "head_source_box": [round(v, 1) for v in head],
             "padded_source_box": [round(v, 1) for v in padded],
             "work_box": None if mapped is None else [round(v, 1) for v in mapped],
             "landmarks_source": [[round(x, 1), round(y, 1)] for x, y in lms],
             "landmarks_work": [[round(x, 1), round(y, 1)] for x, y in lms_work],
             "score": round(float(det["score"]), 3),
-        })
+            "subject_type": det.get("subject_type") or subject_type,
+            "class_name": det.get("class_name") or subject_class,
+            "class_id": det.get("class_id"),
+        }
+        subjects_meta.append(meta)
         if mapped is not None:
             work_boxes.append(mapped)
     if not work_boxes:
-        print("face priority: a face was found but it sits outside the wall crop; using uniform detail")
-        info["detector"] = detector
-        info["faces"] = faces_meta
+        print("subject priority: subject found but outside the wall crop; using uniform detail")
+        info.update({"detector": detector, "detectors": detectors, "detections": subjects_meta,
+                     "faces": subjects_meta, "subject_type": subject_type, "subject_class": subject_class})
         return info
     face_min = max(FACE_REGION_FLOOR_IN, FACE_REGION_FRAC * args.min_region_in)
-    n_face = min(args.colors - 2, max(FACE_MIN_COLORS, int(round(FACE_COLOR_SHARE * args.colors))))
-    n_face = max(1, n_face)
-    n_eye = _eye_color_count(args.colors, n_face)
+    n_skin, n_eye, n_mouth, n_bg = feature_color_budget(args.colors, getattr(args, "detail", None))
+    n_face = n_skin + n_eye + n_mouth
     eye_min = max(EYE_REGION_FLOOR_IN, EYE_REGION_FRAC * face_min) if n_eye else None
+    mouth_min = max(MOUTH_REGION_FLOOR_IN, MOUTH_REGION_FRAC * face_min) if n_mouth else None
     eye_mask = _soft_disks(work_h, work_w, eye_disks_work) if eye_disks_work and n_eye else None
+    mouth_mask = None
+    if mouth_ellipses_work and n_mouth:
+        mouth_mask = np.zeros((work_h, work_w), dtype=np.float32)
+        for cx, cy, rx, ry in mouth_ellipses_work:
+            mouth_mask = np.maximum(mouth_mask, _soft_ellipse(work_h, work_w, cx, cy, rx, ry))
     info.update({
-        "found": True, "detector": detector, "faces": faces_meta,
+        "found": True, "detector": detector, "detectors": detectors,
+        "subject_type": subject_type or (subjects_meta[0].get("subject_type") if subjects_meta else None),
+        "subject_class": subject_class or (subjects_meta[0].get("class_name") if subjects_meta else None),
+        "detections": subjects_meta, "faces": subjects_meta,
         "mask": _soft_mask(work_h, work_w, work_boxes),
         "face_min_region_in": round(face_min, 3), "face_colors_reserved": n_face,
+        "face_skin_colors": n_skin, "background_colors_reserved": n_bg,
         "eye_mask": eye_mask,
         "eye_min_region_in": None if eye_min is None else round(eye_min, 3),
         "eye_colors_reserved": n_eye,
         "eye_count": 0 if eye_mask is None else len(eye_disks_work),
         "eye_disks_work": [[round(cx, 1), round(cy, 1), round(r, 1)] for cx, cy, r in eye_disks_work],
+        "mouth_mask": mouth_mask,
+        "mouth_min_region_in": None if mouth_min is None else round(mouth_min, 3),
+        "mouth_colors_reserved": n_mouth,
+        "mouth_ellipses_work": [[round(v, 1) for v in ell] for ell in mouth_ellipses_work],
     })
     bits = ", ".join(
-        f"score {f['score']}" + (f", work box {f['work_box']}" if f["work_box"] else ", outside crop")
-        for f in faces_meta
+        f"{f.get('class_name', 'person')} score {f['score']}"
+        + (f", work box {f['work_box']}" if f["work_box"] else ", outside crop")
+        for f in subjects_meta
     )
-    msg = (f"face priority: {len(work_boxes)} face(s) ({detector}, {bits}); "
-           f"reserved {n_face} of {args.colors} colors, face min-region {face_min:g} in")
+    kind = info["subject_type"] or "subject"
+    msg = (f"subject priority: {len(work_boxes)} {kind}(s) ({'+'.join(detectors)}, {bits}); "
+           f"reserved {n_face} of {args.colors} colors, subject min-region {face_min:g} in")
     if eye_mask is not None:
         msg += (f"; eye priority: {len(eye_disks_work)} eye(s), reserved {n_eye} colors, "
                 f"eye min-region {eye_min:g} in")
+    if mouth_mask is not None:
+        label = "muzzle" if kind == "animal" else "mouth"
+        msg += (f"; {label} priority: reserved {n_mouth} colors, min-region {mouth_min:g} in")
+    msg += f"; background gets {n_bg} colors (stronger smoothing)"
     print(msg)
     return info
+
+
+def resolve_faces(src, work_img, crop_box, args):
+    return resolve_subject(src, work_img, crop_box, args)
 
 
 def _kmeans_lab(pixels, n, seed=SEED, weight_exp=0.5):
@@ -674,20 +1092,30 @@ def _assign_nearest_lab(rgb, centers_lab):
     return np.sqrt((delta * delta).sum(-1)).argmin(-1).astype(np.int32)
 
 
-def _median_composite(img, face_mask, ppi, eye_mask=None, colors=8):
-    """Stronger noise filter in the background, weaker in the face, none in the eyes."""
-    bg_k = 2 * int(0.1 * ppi) + 1
-    if colors >= 24:
-        bg_k = max(3, bg_k - 2)
-    face_k = 2 * int(0.04 * ppi) + 1
+def _median_composite(img, face_mask, ppi, eye_mask=None, mouth_mask=None, colors=8):
+    """Stronger smoothing in the background; face moderate; eyes/mouth keep original pixels."""
+    bg_k = 2 * int(0.12 * ppi) + 1
+    if colors >= 20:
+        bg_k = min(bg_k + 2, 2 * int(0.16 * ppi) + 1)
+    face_k = 2 * int(0.035 * ppi) + 1
     orig = np.asarray(img)
     bg = np.asarray(img.filter(ImageFilter.MedianFilter(bg_k)))
     face = orig if face_k < 3 else np.asarray(img.filter(ImageFilter.MedianFilter(max(3, face_k))))
     m_face = face_mask[..., None]
     mixed = face * m_face + bg * (1 - m_face)
+    focal = orig.copy()
     if eye_mask is not None:
-        m_eye = eye_mask[..., None]
-        mixed = orig * m_eye + mixed * (1 - m_eye)
+        m_eye = (eye_mask >= 0.35)[..., None]
+        focal = np.where(m_eye, orig, focal)
+    if mouth_mask is not None:
+        m_mouth = (mouth_mask >= 0.35)[..., None]
+        focal = np.where(m_mouth, orig, focal)
+    mask_focal = np.zeros(face_mask.shape, dtype=bool)
+    if eye_mask is not None:
+        mask_focal |= eye_mask >= 0.35
+    if mouth_mask is not None:
+        mask_focal |= mouth_mask >= 0.35
+    mixed = np.where(mask_focal[..., None], focal, mixed)
     return np.rint(mixed).astype(np.uint8)
 
 
@@ -709,34 +1137,52 @@ def _clahe_eyes(rgb, eye_mask, clip=2.0, tile=4):
     return np.rint(enhanced * m + rgb * (1 - m)).astype(np.uint8)
 
 
-def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0, merge_min_dist=3.5):
-    """Reserve palette slots for eyes, then the face, then the background; total stays at N.
-
-    Cluster centers are taken from the un-enhanced image so paint colors stay true to the
-    photo. Assignment inside the eye disks uses a local CLAHE lift so a dark pupil can
-    separate from lens glare, and is locked to the reserved eye centers so it doesn't
-    collapse into hair or skin.
-    """
-    mixed = _median_composite(img, face_mask, ppi, eye_mask, colors=n)
+def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, mouth_mask=None,
+                           n_skin=0, n_eye=0, n_mouth=0, n_bg=0, merge_min_dist=3.5, detail=None):
+    """Reserve palette slots for eyes, mouth, face skin, and a small bg set; total stays at N."""
+    if not n_skin:
+        n_skin, n_eye, n_mouth, n_bg = feature_color_budget(n, detail)
+    mixed = _median_composite(img, face_mask, ppi, eye_mask, mouth_mask, colors=n)
+    orig = np.asarray(img)
     n_eye = n_eye if eye_mask is not None and n_eye > 0 else 0
-    n_face = min(n - n_eye - 2, max(FACE_MIN_COLORS, int(round(FACE_COLOR_SHARE * n))))
-    n_face = max(1, min(n_face, n - n_eye - 1))
-    n_bg = max(1, n - n_face - n_eye)
-    eye_pix = mixed[eye_mask >= 0.5].reshape(-1, 3) if n_eye else np.zeros((0, 3), np.uint8)
-    face_pix = mixed[(face_mask >= 0.5) & ((eye_mask < 0.5) if n_eye else True)].reshape(-1, 3)
+    n_mouth = n_mouth if mouth_mask is not None and n_mouth > 0 else 0
+    eye_f = eye_mask >= 0.5 if eye_mask is not None else np.zeros_like(face_mask, dtype=bool)
+    mouth_f = mouth_mask >= 0.5 if mouth_mask is not None else np.zeros_like(face_mask, dtype=bool)
+    eye_pix = orig[eye_f].reshape(-1, 3) if n_eye else np.zeros((0, 3), np.uint8)
+    mouth_pix = orig[mouth_f].reshape(-1, 3) if n_mouth else np.zeros((0, 3), np.uint8)
+    face_pix = mixed[(face_mask >= 0.5) & ~eye_f & ~mouth_f].reshape(-1, 3)
     bg_pix = mixed[face_mask < 0.5].reshape(-1, 3)
     parts = []
-    n_eye_kept = 0
+    n_eye_kept = n_mouth_kept = 0
     merge = merge_min_dist
-    if n_eye and len(eye_pix) >= n_eye:
-        # Lower weight exponent so a small pupil can still earn its own cluster.
-        eye_c = _merge_close_lab(_kmeans_lab(eye_pix, n_eye, SEED, weight_exp=0.25), min_dist=merge)
+    merge_focal = max(0.8, merge * 0.45)
+    if n_eye and len(eye_pix) >= max(2, n_eye // 2):
+        dark_n = max(1, n_eye // 2)
+        dark = _dark_lab_slots(eye_pix, dark_n, percentile=10)
+        rest = max(0, n_eye - len(dark))
+        if rest:
+            km = _kmeans_lab(eye_pix, rest, SEED, weight_exp=0.2)
+            eye_c = np.vstack([dark, km]) if len(dark) else km
+        else:
+            eye_c = dark
+        eye_c = _merge_close_lab(eye_c, min_dist=merge_focal, target_count=n_eye)
         parts.append(eye_c)
         n_eye_kept = len(eye_c)
+    if n_mouth and len(mouth_pix) >= 1:
+        dark = _dark_lab_slots(mouth_pix, max(1, n_mouth // 2), percentile=18)
+        rest = max(0, n_mouth - len(dark))
+        if rest:
+            km = _kmeans_lab(mouth_pix, rest, SEED + 1, weight_exp=0.25)
+            mouth_c = np.vstack([dark, km]) if len(dark) else km
+        else:
+            mouth_c = dark
+        mouth_c = _merge_close_lab(mouth_c, min_dist=merge_focal, target_count=n_mouth)
+        parts.append(mouth_c)
+        n_mouth_kept = len(mouth_c)
     if len(face_pix):
-        parts.append(_kmeans_lab(face_pix, n_face, SEED + 1))
+        parts.append(_kmeans_lab(face_pix, n_skin, SEED + 2))
     if len(bg_pix):
-        parts.append(_kmeans_lab(bg_pix, n_bg, SEED + 2))
+        parts.append(_kmeans_lab(bg_pix, n_bg, SEED + 3, weight_exp=0.65))
     if not parts:
         return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
     centers = _merge_close_lab(np.vstack(parts), min_dist=merge, target_count=n)
@@ -748,7 +1194,7 @@ def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0, merge
         centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
         n_eye_kept += max(0, len(centers) - before)
     if len(centers) < n and len(face_pix):
-        extra = _kmeans_lab(face_pix, n_face + (n - len(centers)), SEED + 4)
+        extra = _kmeans_lab(face_pix, n_skin + (n - len(centers)), SEED + 4)
         centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
     if len(centers) < n:
         extra = _kmeans_lab(mixed.reshape(-1, 3), n, SEED + 5)
@@ -759,24 +1205,33 @@ def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0, merge
     if len(centers) < 2:
         return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
     labels = _assign_nearest_lab(mixed, centers)
-    # Inside the eye disks, assign against a contrast-lifted view but only to reserved eye colors.
-    if n_eye_kept >= 2:
-        eye_centers = centers[:n_eye_kept]
-        lifted = _clahe_eyes(mixed, eye_mask, clip=2.5, tile=4)
+    off = 0
+    if n_eye_kept >= 1:
+        eye_centers = centers[off:off + n_eye_kept]
+        off += n_eye_kept
+        lifted = _clahe_eyes(mixed, eye_mask, clip=1.6, tile=4)
         labels_eye = _assign_nearest_lab(lifted, eye_centers)
         labels = np.where(eye_mask >= 0.5, labels_eye, labels)
+    if n_mouth_kept >= 1:
+        mouth_centers = centers[off:off + n_mouth_kept]
+        labels_mouth = _assign_nearest_lab(orig, mouth_centers)
+        labels = np.where(mouth_mask >= 0.5, labels_mouth, labels)
     return labels
 
 
-def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=None, preserve_bg=False):
-    """Fine majority inside the face, none in the eyes, coarser in the background; smooth seams."""
+def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=None, mouth_mask=None, preserve_bg=False):
+    """Fine majority inside the face, none in the eyes/mouth, coarser in the background; smooth seams."""
     fine = majority_filter(labels, n, max(1, win_face))
     coarse = majority_filter(labels, n, max(1, win_bg))
     out = np.where(face_mask >= 0.35, fine, labels if preserve_bg else coarse)
     if eye_mask is not None:
-        # Leave eye pixels unsmoothed so a pupil or frame line isn't majority-voted away.
         out = np.where(eye_mask >= 0.35, labels, out)
+    if mouth_mask is not None:
+        out = np.where(mouth_mask >= 0.35, labels, out)
+    if eye_mask is not None:
         seam = (face_mask > 0.12) & (face_mask < 0.75) & (eye_mask < 0.35)
+        if mouth_mask is not None:
+            seam &= mouth_mask < 0.35
     else:
         seam = (face_mask > 0.12) & (face_mask < 0.75)
     if np.any(seam):
@@ -786,13 +1241,21 @@ def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=
 
 
 def clean_regions_face_aware(labels, min_area_px, min_thick_px, face_area_px, face_thick_px,
-                             face_mask, eye_mask=None, eye_area_px=None, eye_thick_px=None,
-                             max_passes=20):
+                             face_mask, eye_mask=None, mouth_mask=None,
+                             eye_area_px=None, eye_thick_px=None, mouth_area_px=None, mouth_thick_px=None,
+                             bg_area_px=None, bg_thick_px=None, max_passes=20):
     """Merge tiny/thin regions, with finer thresholds on the face and finer still in the eyes."""
     if eye_mask is None:
         eye_mask = np.zeros(labels.shape, dtype=np.float32)
         eye_area_px = face_area_px
         eye_thick_px = face_thick_px
+    if mouth_mask is None:
+        mouth_mask = np.zeros(labels.shape, dtype=np.float32)
+        mouth_area_px = eye_area_px
+        mouth_thick_px = eye_thick_px
+    if bg_area_px is None:
+        bg_area_px = min_area_px * (BG_REGION_MULT ** 2)
+        bg_thick_px = min_thick_px * BG_REGION_MULT
     for _ in range(max_passes):
         regions, colors = label_regions(labels)
         ids = np.arange(1, len(colors))
@@ -800,11 +1263,16 @@ def clean_regions_face_aware(labels, min_area_px, min_thick_px, face_area_px, fa
         thick = 2 * ndimage.maximum(interior_distance(labels), regions, ids)
         face_frac = ndimage.mean(face_mask, regions, ids)
         eye_frac = ndimage.mean(eye_mask, regions, ids)
+        mouth_frac = ndimage.mean(mouth_mask, regions, ids)
         # Interpolate through the soft edges so cleanup doesn't form a hard rectangle.
         t_e = np.clip((np.asarray(eye_frac) - 0.1) / 0.5, 0, 1)
+        t_m = np.clip((np.asarray(mouth_frac) - 0.1) / 0.5, 0, 1)
         t_f = np.clip((np.asarray(face_frac) - 0.1) / 0.5, 0, 1)
-        area_lim = eye_area_px * t_e + face_area_px * t_f * (1 - t_e) + min_area_px * (1 - t_f) * (1 - t_e)
-        thick_lim = eye_thick_px * t_e + face_thick_px * t_f * (1 - t_e) + min_thick_px * (1 - t_f) * (1 - t_e)
+        out_face = np.maximum(1 - t_e - t_m, 0)
+        area_lim = (eye_area_px * t_e + mouth_area_px * t_m + face_area_px * t_f * out_face
+                    + bg_area_px * (1 - t_f) * (1 - np.maximum(t_e, t_m)))
+        thick_lim = (eye_thick_px * t_e + mouth_thick_px * t_m + face_thick_px * t_f * out_face
+                     + bg_thick_px * (1 - t_f) * (1 - np.maximum(t_e, t_m)))
         bad = ids[(area < area_lim) | (thick < thick_lim)]
         if len(bad) == 0:
             return labels
@@ -923,10 +1391,27 @@ def clean_regions(labels, min_area_px, min_thick_px, max_passes=20):
     return labels
 
 
-def finalize_palette(labels, rgb):
-    """Renumber used colors 0..m-1 from lightest to darkest; return labels and mean RGB per color."""
+def _palette_swatch_rgb(labels, rgb, k, eye_mask=None, mouth_mask=None):
+    m = labels == k
+    if not np.any(m):
+        return rgb[m].mean(axis=0)
+    if eye_mask is not None and np.any(m & (eye_mask >= 0.35)):
+        sel = rgb[m & (eye_mask >= 0.35)]
+        l = rgb_to_lab(sel)[:, 0]
+        dark = sel[l <= np.percentile(l, 22)]
+        return dark[np.argmin(rgb_to_lab(dark)[:, 0])] if len(dark) else sel[np.argmin(l)]
+    if mouth_mask is not None and np.any(m & (mouth_mask >= 0.35)):
+        sel = rgb[m & (mouth_mask >= 0.35)]
+        l = rgb_to_lab(sel)[:, 0]
+        dark = sel[l <= np.percentile(l, 25)]
+        return dark[np.argmin(rgb_to_lab(dark)[:, 0])] if len(dark) else sel[l.argmin()]
+    return rgb[m].mean(axis=0)
+
+
+def finalize_palette(labels, rgb, eye_mask=None, mouth_mask=None):
+    """Renumber used colors 0..m-1 from lightest to darkest; eye/mouth swatches use darkest pixels."""
     used = np.unique(labels)
-    means = np.array([rgb[labels == k].mean(axis=0) for k in used])
+    means = np.array([_palette_swatch_rgb(labels, rgb, k, eye_mask, mouth_mask) for k in used])
     order = np.argsort(-rgb_to_lab(means)[:, 0], kind="stable")
     remap = np.zeros(labels.max() + 1, dtype=np.int32)
     remap[used[order]] = np.arange(len(used))
@@ -1395,7 +1880,7 @@ def neighbor_tag(cv, x, y, text, direction):
 
 
 def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions, palette, style,
-               face_mask=None, eye_mask=None):
+               face_mask=None, eye_mask=None, mouth_mask=None):
     page = (layout.page_w * PT, layout.page_h * PT)
     cv.setPageSize(page)
     k = job["scale"] / job["ppi"]                 # paper inches per work pixel
@@ -1485,6 +1970,8 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
         masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
     if eye_mask is not None:
         masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
+    if mouth_mask is not None:
+        masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
     placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, k * PT, style, masks)
     cv.setFillColor(HexColor("#000000"))
     for x, y, text, size in placed:
@@ -1675,7 +2162,7 @@ def pick_preview_sheets(preview_sheets, layout, regions, face, k, face_mask=None
 
 def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
                           chunks, boxes, labels, regions, palette_arr, style, sample_sheets,
-                          face_mask=None, eye_mask=None):
+                          face_mask=None, eye_mask=None, mouth_mask=None):
     cv = Canvas(str(path), pagesize=letter, invariant=1, pageCompression=1)
     cv.setTitle("Paint-by-number mural (preview)")
     cover_pages, key_on_cover = draw_cover(cv, job, small, palette, areas, brand_map, layout)
@@ -1684,7 +2171,7 @@ def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, m
     draw_map(cv, job, small, layout, mural_w, mural_h)
     for r, c, _reason in sample_sheets:
         draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
-                   palette_arr, style, face_mask=face_mask, eye_mask=eye_mask)
+                   palette_arr, style, face_mask=face_mask, eye_mask=eye_mask, mouth_mask=mouth_mask)
     cv.save()
     return cover_pages
 
@@ -1788,14 +2275,15 @@ def main():
 
     if getattr(a, "_from_preview_dir", None):
         meta = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text())
-        labels, palette, regions, face_mask, eye_mask = load_saved_labels(a._from_preview_dir)
+        labels, palette, regions, face_mask, eye_mask, mouth_mask = load_saved_labels(a._from_preview_dir)
         _, region_colors = label_regions(labels)
         ppi = float(meta["ppi"])
         fit_note = meta["fit_note"]
         crop_box = tuple(meta["crop_box"])
-        face = dict(meta["face_priority"])
+        face = dict(meta.get("subject_priority") or meta["face_priority"])
         face["mask"] = face_mask
         face["eye_mask"] = eye_mask
+        face["mouth_mask"] = mouth_mask
         resolved.update({"ppi": ppi, "fit_note": fit_note, "detail": meta.get("detail"), "prep": meta.get("prep")})
         print(f"from-preview: loaded {LABELS_ARCHIVE} from {a._from_preview_dir} "
               f"({labels.shape[1]}x{labels.shape[0]} work px, {int(regions.max())} regions)")
@@ -1804,7 +2292,9 @@ def main():
         src = apply_image_prep(src, a.prep)
         resolved["prep"] = a.prep
         want_upscale = False
-        if not a.no_face_priority and (a.face_box or _detect_faces_yunet(src)):
+        if not subject_priority_off(a) and (
+            manual_subject_box(a) or _detect_faces_yunet(src) or _detect_animals_yolox(src)
+        ):
             want_upscale = True
         ppi = min(TARGET_PPI, math.sqrt(MAX_WORK_PIXELS / (wall_w_in * wall_h_in)))
         ppi = _maybe_upscale_ppi(src, wall_w_in, wall_h_in, ppi, enabled=want_upscale)
@@ -1812,48 +2302,57 @@ def main():
         img, fit_note, crop_box = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
         resolved["fit_note"] = fit_note
         rgb = np.asarray(img)
-        face = resolve_faces(src, img, crop_box, a)
+        face = resolve_subject(src, img, crop_box, a)
         merge_min = lab_merge_min_dist(a.detail, a.colors, a.wall_width_ft, a.wall_height_ft)
         if face["mask"] is not None:
             labels = quantize_face_priority(
                 img, a.colors, ppi, face["mask"],
-                eye_mask=face.get("eye_mask"), n_eye=face.get("eye_colors_reserved") or 0,
-                merge_min_dist=merge_min,
+                eye_mask=face.get("eye_mask"), mouth_mask=face.get("mouth_mask"),
+                n_skin=face.get("face_skin_colors") or 0,
+                n_eye=face.get("eye_colors_reserved") or 0,
+                n_mouth=face.get("mouth_colors_reserved") or 0,
+                n_bg=face.get("background_colors_reserved") or 2,
+                merge_min_dist=merge_min, detail=a.detail,
             )
             face_min = face["face_min_region_in"]
             eye_min = face.get("eye_min_region_in")
-            win_bg = int(round(a.min_region_in / 4 * ppi)) | 1
+            mouth_min = face.get("mouth_min_region_in")
+            win_bg = int(round(a.min_region_in * BG_REGION_MULT / 3 * ppi)) | 1
             win_face = int(round(face_min / 4 * ppi)) | 1
             if a.detail == "photo" and is_canvas_job(a.wall_width_ft, a.wall_height_ft):
                 win_bg = max(1, win_bg // 2)
             labels = majority_filter_face_aware(
-                labels, a.colors, win_bg, win_face, face["mask"], eye_mask=face.get("eye_mask"),
+                labels, a.colors, win_bg, win_face, face["mask"],
+                eye_mask=face.get("eye_mask"), mouth_mask=face.get("mouth_mask"),
                 preserve_bg=(a.detail == "photo" and is_canvas_job(a.wall_width_ft, a.wall_height_ft)),
             )
-            eye_kwargs = {}
+            kw = {
+                "eye_mask": face.get("eye_mask"), "mouth_mask": face.get("mouth_mask"),
+                "bg_area_px": (a.min_region_in * BG_REGION_MULT * ppi) ** 2,
+                "bg_thick_px": a.min_region_in * BG_REGION_MULT / 2 * ppi,
+            }
             if eye_min:
-                eye_kwargs = {
-                    "eye_mask": face["eye_mask"],
-                    "eye_area_px": (eye_min * ppi) ** 2,
-                    "eye_thick_px": eye_min / 2 * ppi,
-                }
+                kw.update({"eye_area_px": (eye_min * ppi) ** 2, "eye_thick_px": eye_min / 2 * ppi})
+            if mouth_min:
+                kw.update({"mouth_area_px": (mouth_min * ppi) ** 2, "mouth_thick_px": mouth_min / 2 * ppi})
             labels = clean_regions_face_aware(
                 labels,
                 (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi,
                 (face_min * ppi) ** 2, face_min / 2 * ppi,
                 face["mask"],
-                **eye_kwargs,
+                **kw,
             )
         else:
             labels = quantize(img, a.colors, ppi, merge_min_dist=merge_min)
             window = int(round(a.min_region_in / 4 * ppi)) | 1
             labels = majority_filter(labels, a.colors, window)
             labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
-        labels, palette = finalize_palette(labels, rgb)
+        labels, palette = finalize_palette(labels, rgb, face.get("eye_mask"), face.get("mouth_mask"))
         regions, region_colors = label_regions(labels)
     n = len(palette)
     face_mask = face.get("mask")
     eye_mask = face.get("eye_mask")
+    mouth_mask = face.get("mouth_mask")
 
     wall_sqft = wall_w_in * wall_h_in / 144
     counts = np.bincount(labels.ravel(), minlength=n)
@@ -1888,17 +2387,17 @@ def main():
     front_pages = cover_pages + key_pages + 1  # cover + optional key pages + placement map
     labeled = set()
     chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=sigma))
-    f_mask, e_mask = face_mask, eye_mask
+    f_mask, e_mask, m_mask = face_mask, eye_mask, mouth_mask
     if not a.preview_only:
         for r in range(layout.rows):
             for c in range(layout.cols):
                 labeled |= draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
-                                      palette, style, face_mask=f_mask, eye_mask=e_mask)
+                                      palette, style, face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask)
     cv.save()
 
     preview_samples = []
     if a.preview_only:
-        save_preview_job(a.out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask)
+        save_preview_job(a.out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask, mouth_mask)
         print(f"preview job: {a.out / PREVIEW_JOB_NAME}")
         print(f"preview job: {a.out / LABELS_ARCHIVE}")
         k_sheet = job["scale"] / job["ppi"]
@@ -1906,7 +2405,7 @@ def main():
         kit_pdf = a.out / "preview_kit.pdf"
         build_preview_kit_pdf(kit_pdf, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
                               chunks, boxes, labels, regions, palette, style, preview_samples,
-                              face_mask=f_mask, eye_mask=e_mask)
+                              face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask)
         outlined = a.out / "preview_outlined.png"
         draw_preview_outlined(outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style)
         pages_dir = a.out / "preview_pages"
@@ -1927,17 +2426,22 @@ def main():
         "requested_colors": a.colors, "colors_used": n, "transfer": a.transfer, "scale": a.scale,
         "fit": fit_note, "work_px_per_wall_in": round(ppi, 2), "min_region_in": a.min_region_in,
         "detail": a.detail, "prep": resolved.get("prep"), "trace_sigma": round(sigma, 3),
-        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask),
+        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask, mouth_mask),
         "sheets": {"count": layout.count, "rows": layout.rows, "cols": layout.cols,
                    "orientation": "landscape" if layout.landscape else "portrait", "overlap_in": a.overlap_in},
         "regions": int(regions.max()),
         "front_pages": front_pages,
         "colors": areas,
+        "subject_priority": _subject_meta_for_json(face),
         "face_priority": {
             "enabled": face["enabled"],
             "found": face["found"],
+            "subject_type": face.get("subject_type"),
+            "subject_class": face.get("subject_class"),
             "detector": face["detector"],
-            "faces": face["faces"],
+            "detectors": face.get("detectors", []),
+            "detections": face.get("detections", face.get("faces", [])),
+            "faces": face.get("faces", []),
             "face_colors_reserved": face["face_colors_reserved"],
             "face_min_region_in": face["face_min_region_in"],
             "eye_priority": face.get("eye_count", 0) > 0,
@@ -1945,6 +2449,12 @@ def main():
             "eye_colors_reserved": face.get("eye_colors_reserved", 0),
             "eye_min_region_in": face.get("eye_min_region_in"),
             "eye_disks_work": face.get("eye_disks_work", []),
+            "mouth_priority": (face.get("mouth_colors_reserved") or 0) > 0,
+            "mouth_colors_reserved": face.get("mouth_colors_reserved", 0),
+            "mouth_min_region_in": face.get("mouth_min_region_in"),
+            "mouth_ellipses_work": face.get("mouth_ellipses_work", []),
+            "face_skin_colors": face.get("face_skin_colors", 0),
+            "background_colors_reserved": face.get("background_colors_reserved", 0),
         },
     }
     if not a.preview_only:
