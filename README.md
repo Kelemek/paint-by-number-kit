@@ -7,9 +7,15 @@ Helper scripts for the Paint by Number Grok Bot template. They turn a picture in
 ```bash
 git clone https://github.com/Kelemek/paint-by-number-kit ~/mural-kit
 ~/mural-kit/get_model.sh
-python3 -m pip install --user --break-system-packages pillow numpy scipy scikit-learn reportlab pypdf opencv-python-headless
+python3 -m pip install --user --break-system-packages -r ~/mural-kit/requirements.txt
 python3 ~/mural-kit/mural_tiler.py --help
 ```
+
+Dependency versions in `requirements.txt` are pinned on purpose for safety and are bumped deliberately.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
 
 ## Files
 
