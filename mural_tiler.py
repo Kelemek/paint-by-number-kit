@@ -2139,9 +2139,11 @@ def render_focal_sheet_crop(
     eye_mask=None,
     mouth_mask=None,
     face_mask=None,
-    dpi=144,
+    mural_w=None,
+    mural_h=None,
+    dpi=192,
 ):
-    """Rasterize full-build sheet PDF page(s) and crop the same work-pixel bbox as preview columns."""
+    """Mosaic every full-build sheet over the focal work-pixel bbox (same crop as preview columns)."""
     if box is None:
         return None
     job_dir = Path(job_dir)
@@ -2151,30 +2153,16 @@ def render_focal_sheet_crop(
     x0, y0, x1, y1 = (int(v) for v in box)
     out_w, out_h = max(1, x1 - x0), max(1, y1 - y0)
     k = job["scale"] / job["ppi"]
-    hits = _sheets_intersecting_box(layout, k, box)
+    if mural_w is None or mural_h is None:
+        mural_w = layout.cols * layout.step_x
+        mural_h = layout.rows * layout.step_y
+    hits = _sheets_intersecting_box(layout, k, box, mural_w, mural_h)
     if not hits:
-        pick = _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask)
-        if not pick:
-            return None
-        r, c, _ = pick
-        wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
-        ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
-        ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
-        hits = [(0, r, c, ix0, iy0, ix1, iy1)]
-    covered = 0.0
-    box_area = float((x1 - x0) * (y1 - y0))
-    pick_sheets = []
-    for item in hits:
-        pick_sheets.append(item)
-        covered += item[0]
-        if covered >= 0.92 * box_area or len(pick_sheets) >= 2:
-            break
-    if not pick_sheets:
-        pick_sheets = [hits[0]]
+        return None
     front_pages = _front_pages_for_full_build(job_dir)
     canvas = np.full((out_h, out_w, 3), 245, np.uint8)
     page_cache = {}
-    for _area, r, c, ix0, iy0, ix1, iy1 in pick_sheets:
+    for _area, r, c, ix0, iy0, ix1, iy1 in hits:
         page_num = _sheet_pdf_page(front_pages, layout, r, c)
         if page_num not in page_cache:
             img = rasterize_pdf_page(pdf, page_num, dpi=dpi)
@@ -2374,7 +2362,24 @@ def _work_px_to_page_px(px, py, r, c, layout, job, dpi):
     return page_x_pt * scale, (page_h_pt - page_y_pt) * scale
 
 
-def _sheets_intersecting_box(layout, k, box):
+def _sheet_unique_work_rect(layout, r, c, k, mural_w, mural_h):
+    """Wall-owned pixels for one sheet (overlap band counted only on the sheet that tapes over it)."""
+    sx0, sy0 = c * layout.step_x, r * layout.step_y
+    ov = layout.overlap
+    ux0_m = sx0 if c == 0 else sx0 + ov
+    uy0_m = sy0 if r == 0 else sy0 + ov
+    if c == layout.cols - 1:
+        ux1_m = min(sx0 + layout.cw, mural_w)
+    else:
+        ux1_m = sx0 + layout.step_x
+    if r == layout.rows - 1:
+        uy1_m = min(sy0 + layout.ch, mural_h)
+    else:
+        uy1_m = sy0 + layout.step_y
+    return ux0_m / k, uy0_m / k, ux1_m / k, uy1_m / k
+
+
+def _sheets_intersecting_box(layout, k, box, mural_w, mural_h):
     x0, y0, x1, y1 = (int(v) for v in box)
     hits = []
     for r in range(layout.rows):
@@ -2385,7 +2390,7 @@ def _sheets_intersecting_box(layout, k, box):
             area = _rect_intersection_area(x0, y0, x1, y1, wx0, wy0, wx1, wy1)
             if area > 0 and ix1 > ix0 and iy1 > iy0:
                 hits.append((area, r, c, ix0, iy0, ix1, iy1))
-    hits.sort(key=lambda t: t[0], reverse=True)
+    hits.sort(key=lambda t: (t[1], t[2]))
     return hits
 
 

@@ -15,13 +15,13 @@ sys.path.insert(0, str(ROOT))
 from mural_tiler import (  # noqa: E402
     LABELS_ARCHIVE,
     PREVIEW_JOB_NAME,
-    _focal_box_from_masks,
     apply_image_prep,
     choose_layout,
     fit_to_wall,
     render_focal_sheet_crop,
     rgb_to_lab,
 )
+from scripts.rembrandt_focal_verify import focal_bbox  # noqa: E402
 
 L_TOLERANCE = 5.0
 MONOLITH_FRAC = 0.32
@@ -104,6 +104,59 @@ def check_monolithic_focal(
     return True, top_frac
 
 
+MOSAIC_IOU_MIN = 0.5
+
+
+def focal_bbox_from_meta(meta, shape):
+    for key in ("subject_priority", "face_priority"):
+        fp = meta.get(key) or {}
+        if fp.get("eye_disks_work") or fp.get("mouth_ellipses_work"):
+            box = focal_bbox(fp)
+            if box is not None:
+                return box
+    return None
+
+
+def _label_boundary_mask(labels, x0, y0, x1, y1):
+    sub = labels[y0:y1, x0:x1]
+    edge = np.zeros(sub.shape, dtype=bool)
+    edge[1:, :] |= sub[1:, :] != sub[:-1, :]
+    edge[:, 1:] |= sub[:, 1:] != sub[:, :-1]
+    return edge
+
+
+def _mosaic_outline_mask(crop, thresh=14):
+    gray = np.dot(crop[..., :3], [0.299, 0.587, 0.114]).astype(np.float32)
+    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    ink = gray < 88
+    grad = (gx + gy) > thresh
+    return ink | grad
+
+
+def mosaic_label_boundary_iou(crop, labels, box, dilate=3, match_px=12):
+    """Overlap of dilated label-map edges with mosaic outline ink (tolerant of rasterization)."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    if crop is None or crop.shape[0] != y1 - y0 or crop.shape[1] != x1 - x0:
+        return 0.0
+    struct = ndimage.generate_binary_structure(2, 1)
+    label_e = _label_boundary_mask(labels, x0, y0, x1, y1)
+    label_e = ndimage.binary_dilation(label_e, iterations=dilate, structure=struct)
+    mosaic_e = _mosaic_outline_mask(crop)
+    mosaic_e = ndimage.binary_dilation(mosaic_e, iterations=dilate, structure=struct)
+    band = mosaic_e
+    if match_px > 0:
+        dt = ndimage.distance_transform_edt(~mosaic_e)
+        band = band | (dt <= match_px)
+    inter = float(np.logical_and(label_e, band).sum())
+    union = float(np.logical_or(label_e, band).sum())
+    if union <= 0 or label_e.sum() <= 0:
+        return 0.0
+    jaccard = inter / union
+    recall = inter / float(label_e.sum())
+    return max(jaccard, recall)
+
+
 def _digitish_blobs(gray, region):
     blob = ((gray < 110) & region).astype(np.int32)
     labels_cc, nlab = ndimage.label(blob)
@@ -115,7 +168,7 @@ def _digitish_blobs(gray, region):
     return count
 
 
-def check_focal_sheet_crop(crop, eye_mask, box, mouth_mask=None):
+def check_focal_sheet_crop(crop, eye_mask, box, mouth_mask=None, labels=None):
     """Sheet column must show real PDF linework and number-like strokes in the eye area."""
     if crop is None or crop.size == 0:
         return ["missing focal sheet crop"]
@@ -140,6 +193,10 @@ def check_focal_sheet_crop(crop, eye_mask, box, mouth_mask=None):
         digits = _digitish_blobs(gray, region)
         if digits < 1:
             fails.append("no number-like strokes in eye sheet crop")
+    if labels is not None and box is not None:
+        iou = mosaic_label_boundary_iou(crop, labels, box)
+        if iou < MOSAIC_IOU_MIN:
+            fails.append(f"sheet mosaic outline IoU {iou:.2f} < {MOSAIC_IOU_MIN}")
     return fails
 
 
@@ -198,9 +255,15 @@ def audit_job(job_dir: Path, check_sheet_crop=False):
             "ppi": float(meta["ppi"]),
             "sheet_tint": float(meta.get("argv", {}).get("sheet_tint", 0)),
         }
-        box = _focal_box_from_masks(eye_mask, mouth_mask, labels.shape)
-        crop = render_focal_sheet_crop(job_dir, layout, job, box, eye_mask, mouth_mask, face_mask)
-        failures.extend(check_focal_sheet_crop(crop, eye_mask, box, mouth_mask))
+        box = focal_bbox_from_meta(meta, labels.shape)
+        if box is None:
+            failures.append("missing focal bbox for sheet mosaic")
+        else:
+            mural_w, mural_h = w_in * scale, h_in * scale
+            crop = render_focal_sheet_crop(
+                job_dir, layout, job, box, eye_mask, mouth_mask, face_mask, mural_w=mural_w, mural_h=mural_h,
+            )
+            failures.extend(check_focal_sheet_crop(crop, eye_mask, box, mouth_mask, labels))
     return failures
 
 

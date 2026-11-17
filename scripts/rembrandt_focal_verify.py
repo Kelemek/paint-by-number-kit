@@ -154,7 +154,10 @@ def analyze_dir(job_dir: Path, tag: str):
     sk = skin_mask(face_mask, eye_mask, mouth_mask, labels.shape)
     lm = meta["label_metrics"]
     box = focal_bbox(face)
-    sheet = render_focal_sheet_crop(job_dir, layout, job, box, eye_mask, mouth_mask, face_mask)
+    mural_w, mural_h = wall_w_in * scale, wall_h_in * scale
+    sheet = render_focal_sheet_crop(
+        job_dir, layout, job, box, eye_mask, mouth_mask, face_mask, mural_w=mural_w, mural_h=mural_h,
+    )
     row = {
         "tag": tag,
         "detail": meta["detail"],
