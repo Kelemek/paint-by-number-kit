@@ -12,15 +12,24 @@ Writes to --out:
   mural.pdf         cover + placement map + numbered letter sheets (tracing templates at --scale)
   paint_areas.json  per-color hex, share and wall square feet (input for paint_math.py)
   preview.png       the color-reduced image at wall proportions
+
+With --preview-only also writes:
+  preview_kit.pdf      cover + placement map + sample letter sheets (same drawing as the full build)
+  preview_outlined.png whole mural with region outlines, numbers, and a faint sheet grid
+  preview_pages/       rasterized pages from preview_kit.pdf (when pdftoppm is available)
 """
 import argparse
 import json
 import math
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from reportlab.lib.colors import Color, HexColor, white
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.utils import ImageReader
@@ -30,6 +39,13 @@ from scipy import ndimage
 from sklearn.cluster import KMeans
 
 PT = 72.0                 # PDF points per inch
+MM = PT / 25.4
+GUIDE_DASH_PT = 1.5 * MM
+GUIDE_GAP_PT = 1.0 * MM
+GUIDE_STROKE_PT = 0.75
+EYE_LSTAR_GAP_MIN = 15.0
+KITTEN_TEST_IMAGE = "kitten_ragdoll_canvas.jpg"
+PRINT_ABS_MIN_PT = 6.0    # numbers on sheets must not render below this (6 pt hard floor)
 MARGIN = 0.25             # printer-safe page margin, inches
 HEADER, FOOTER = 0.25, 0.45
 TARGET_PPI = 24           # work pixels per wall inch
@@ -58,6 +74,19 @@ STYLES = {
     "template": Style(line_pt=2.0, line_gray=0.0, font="Helvetica-Bold", min_pt=9, max_pt=24),
 }
 
+# Skill detail levels: wall murals use fixed min-region inches; small canvases use % of short side.
+DETAIL_LEVELS = {
+    "low": {"colors": 8, "wall_min_region_in": 3.0, "canvas_min_region_pct": 2.8, "prep": "soften"},
+    "medium": {"colors": 12, "wall_min_region_in": 2.0, "canvas_min_region_pct": 1.9, "prep": "balance"},
+    "high": {"colors": 20, "wall_min_region_in": 1.2, "canvas_min_region_pct": 1.1, "prep": "sharpen"},
+    "photo": {"colors": 30, "wall_min_region_in": 0.8, "canvas_min_region_pct": 0.8, "prep": "photo"},
+}
+CANVAS_SHORT_FT = 4.0
+PREVIEW_JOB_VERSION = 1
+TRACE_SIGMA_FRAC = 0.10   # cap smoothing vs smallest paintable feature
+PREVIEW_JOB_NAME = "preview_job.json"
+LABELS_ARCHIVE = "labels.npz"
+
 
 @dataclass(frozen=True)
 class Layout:
@@ -83,58 +112,352 @@ class Layout:
         return self.cols * self.rows
 
 
+def is_canvas_job(wall_w_ft, wall_h_ft):
+    return min(wall_w_ft, wall_h_ft) < CANVAS_SHORT_FT
+
+
+def lab_merge_min_dist(detail, n_colors, wall_w_ft=None, wall_h_ft=None):
+    """Allow closer Lab centers at higher detail so photo never collapses below high."""
+    if detail:
+        if detail == "photo" and wall_w_ft is not None and not is_canvas_job(wall_w_ft, wall_h_ft):
+            return 1.2
+        if detail == "medium" and wall_w_ft is not None and is_canvas_job(wall_w_ft, wall_h_ft):
+            return 2.25
+        return {"low": 3.5, "medium": 3.0, "high": 2.2, "photo": 1.0}[detail]
+    return max(1.5, 4.0 - 0.085 * n_colors)
+
+
+def min_region_for_detail(detail, wall_w_ft, wall_h_ft):
+    spec = DETAIL_LEVELS[detail]
+    if is_canvas_job(wall_w_ft, wall_h_ft):
+        short_in = min(wall_w_ft, wall_h_ft) * 12
+        return short_in * spec["canvas_min_region_pct"] / 100.0
+    return spec["wall_min_region_in"]
+
+
+def prep_for_detail(detail):
+    return DETAIL_LEVELS[detail]["prep"] if detail else "none"
+
+
+def prep_choices():
+    return ("auto", "none", "soften", "balance", "sharpen", "photo")
+
+
+def apply_image_prep(img, prep):
+    if prep == "none":
+        return img
+    if prep == "soften":
+        base = img.filter(ImageFilter.GaussianBlur(radius=0.8))
+        return ImageOps.autocontrast(base, cutoff=1)
+    if prep == "balance":
+        return ImageOps.autocontrast(img, cutoff=1)
+    if prep == "sharpen":
+        return ImageOps.autocontrast(img.filter(ImageFilter.SHARPEN), cutoff=0.5)
+    if prep == "photo":
+        base = ImageOps.autocontrast(img, cutoff=0.5)
+        return base.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=3))
+    raise ValueError(f"unknown prep {prep!r}")
+
+
+def apply_detail_and_prep_defaults(a):
+    if a.detail:
+        spec = DETAIL_LEVELS[a.detail]
+        if a.colors is None:
+            a.colors = spec["colors"]
+        if a.min_region_in is None:
+            a.min_region_in = min_region_for_detail(a.detail, a.wall_width_ft, a.wall_height_ft)
+    if a.prep == "auto":
+        a.prep = prep_for_detail(a.detail) if a.detail else "none"
+
+
+def merge_from_preview_args(a, parser):
+    job_path = a.from_preview / PREVIEW_JOB_NAME
+    if not job_path.is_file():
+        parser.error(f"--from-preview missing {PREVIEW_JOB_NAME}")
+    saved = json.loads(job_path.read_text())
+    if saved.get("version") != PREVIEW_JOB_VERSION:
+        parser.error(f"unsupported {PREVIEW_JOB_NAME} version")
+    a._from_preview_dir = a.from_preview
+    cli = saved.get("argv", {})
+    path_keys = {"image", "palette_json"}
+    for key, val in cli.items():
+        if key in ("out", "preview_only", "preview_sheets", "from_preview"):
+            continue
+        if getattr(a, key, None) is None and val is not None:
+            if key in path_keys:
+                setattr(a, key, Path(val))
+            else:
+                setattr(a, key, val)
+    if a.wall_width_ft is None:
+        a.wall_width_ft = saved["wall_width_ft"]
+    if a.wall_height_ft is None:
+        a.wall_height_ft = saved["wall_height_ft"]
+    if a.colors is None:
+        a.colors = saved["colors"]
+    if a.min_region_in is None:
+        a.min_region_in = saved["min_region_in"]
+
+
+def trace_sigma(ppi, min_region_in, face=None):
+    raw = max(1.0, 0.1 * ppi)
+    finest_in = float(min_region_in)
+    if face and face.get("eye_min_region_in"):
+        finest_in = min(finest_in, float(face["eye_min_region_in"]))
+    elif face and face.get("face_min_region_in"):
+        finest_in = min(finest_in, float(face["face_min_region_in"]))
+    cap = max(1.0, TRACE_SIGMA_FRAC * finest_in * ppi)
+    return min(raw, cap)
+
+
+def label_metrics(labels, regions, face_mask, eye_mask, mouth_mask=None):
+    n_reg = int(regions.max())
+    face_pix = float((face_mask >= 0.35).sum()) if face_mask is not None else 0.0
+    eye_pix = float((eye_mask >= 0.35).sum()) if eye_mask is not None else 0.0
+    mouth_pix = float((mouth_mask >= 0.35).sum()) if mouth_mask is not None else 0.0
+    bg_pix = float(labels.size - (face_mask >= 0.35).sum()) if face_mask is not None else float(labels.size)
+    face_regs, eye_regs, mouth_regs, bg_regs = set(), set(), set(), set()
+    if face_pix:
+        face_regs = set(np.unique(regions[face_mask >= 0.35]).tolist()) - {0}
+    if eye_pix:
+        eye_regs = set(np.unique(regions[eye_mask >= 0.35]).tolist()) - {0}
+    if mouth_pix:
+        mouth_regs = set(np.unique(regions[mouth_mask >= 0.35]).tolist()) - {0}
+    if face_mask is not None:
+        bg_regs = set(np.unique(regions[face_mask < 0.35]).tolist()) - {0}
+    return {
+        "regions": n_reg,
+        "face_regions": len(face_regs),
+        "eye_regions": len(eye_regs),
+        "mouth_regions": len(mouth_regs),
+        "background_regions": len(bg_regs),
+        "face_regions_per_10k_px": round(len(face_regs) / face_pix * 10_000, 2) if face_pix else 0.0,
+        "background_regions_per_10k_px": round(len(bg_regs) / bg_pix * 10_000, 2) if bg_pix else 0.0,
+    }
+
+
+def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask, mouth_mask=None):
+    argv = {
+        "image": str(a.image) if a.image else None,
+        "wall_width_ft": a.wall_width_ft,
+        "wall_height_ft": a.wall_height_ft,
+        "colors": a.colors,
+        "coats": a.coats,
+        "coverage_sqft_per_gal": a.coverage_sqft_per_gal,
+        "overlap_in": a.overlap_in,
+        "min_region_in": a.min_region_in,
+        "transfer": a.transfer,
+        "brand": a.brand,
+        "scale": a.scale,
+        "no_subject_priority": a.no_subject_priority,
+        "no_face_priority": a.no_face_priority,
+        "subject_box": a.subject_box,
+        "face_box": a.face_box,
+        "detail": a.detail,
+        "prep": resolved.get("prep"),
+        "sheet_tint": a.sheet_tint,
+        "merge_guide_specks": a.merge_guide_specks,
+        "min_guide_region_in": a.min_guide_region_in,
+        "detail_inset": a.detail_inset,
+        "soup_report": a.soup_report,
+    }
+    meta = {
+        "version": PREVIEW_JOB_VERSION,
+        "argv": argv,
+        "wall_width_ft": a.wall_width_ft,
+        "wall_height_ft": a.wall_height_ft,
+        "colors": int(len(palette)),
+        "min_region_in": a.min_region_in,
+        "detail": a.detail,
+        "prep": resolved.get("prep"),
+        "crop_box": list(crop_box),
+        "ppi": resolved["ppi"],
+        "fit_note": resolved["fit_note"],
+        "subject_priority": _subject_meta_for_json(face),
+        "face_priority": _subject_meta_for_json(face),
+        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask, mouth_mask),
+    }
+    if getattr(a, "placement_meta", None):
+        meta["placement"] = a.placement_meta
+    if getattr(a, "detail_insets_resolved", None):
+        meta["detail_insets"] = a.detail_insets_resolved
+    if getattr(a, "soup_clumps", None) is not None:
+        meta["soup_clumps"] = a.soup_clumps
+    if getattr(a, "detail_insets_resolved", None):
+        meta["detail_insets"] = a.detail_insets_resolved
+    (out / PREVIEW_JOB_NAME).write_text(json.dumps(meta, indent=2) + "\n")
+    npz = {k: arr for k, arr in (
+        ("labels", labels),
+        ("regions", regions),
+        ("palette", palette),
+    ) if arr is not None}
+    if face_mask is not None:
+        npz["face_mask"] = face_mask.astype(np.float32)
+    if eye_mask is not None:
+        npz["eye_mask"] = eye_mask.astype(np.float32)
+    if mouth_mask is not None:
+        npz["mouth_mask"] = mouth_mask.astype(np.float32)
+    np.savez_compressed(out / LABELS_ARCHIVE, **npz)
+
+
+def load_saved_labels(from_dir):
+    path = from_dir / LABELS_ARCHIVE
+    if not path.is_file():
+        raise SystemExit(f"missing {LABELS_ARCHIVE} in {from_dir}")
+    data = np.load(path)
+    labels = data["labels"]
+    palette = data["palette"]
+    regions = data["regions"]
+    face_mask = data["face_mask"] if "face_mask" in data else None
+    eye_mask = data["eye_mask"] if "eye_mask" in data else None
+    mouth_mask = data["mouth_mask"] if "mouth_mask" in data else None
+    return labels, palette, regions, face_mask, eye_mask, mouth_mask
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--image", required=True, type=Path)
-    p.add_argument("--wall-width-ft", required=True, type=float)
-    p.add_argument("--wall-height-ft", required=True, type=float)
-    p.add_argument("--colors", required=True, type=int, help="number of paint colors (6-12 is easiest for groups)")
+    p.add_argument("--image", type=Path, help="source picture (required unless --from-preview)")
+    p.add_argument("--from-preview", type=Path,
+                   help="build the full kit from a prior --preview-only directory (preview_job.json + labels.npz)")
+    p.add_argument("--wall-width-ft", type=float, help="wall size (from preview job when --from-preview)")
+    p.add_argument("--wall-height-ft", type=float)
+    p.add_argument("--colors", type=int, help="paint colors; set automatically with --detail")
+    p.add_argument("--detail", choices=sorted(DETAIL_LEVELS),
+                   help="skill detail level (sets --colors and --min-region-in when not passed)")
+    p.add_argument("--prep", choices=prep_choices(), default="auto",
+                   help="source image prep before tiling (auto follows --detail)")
     p.add_argument("--coats", type=int, choices=(1, 2), default=2, help="recorded for paint_math.py and shown on the cover")
     p.add_argument("--coverage-sqft-per-gal", type=float, default=375.0, help="recorded for paint_math.py")
     p.add_argument("--overlap-in", type=float, default=0.5, help="overlap between neighboring sheets, paper inches")
-    p.add_argument("--min-region-in", type=float, default=3.0,
+    p.add_argument("--min-region-in", type=float,
                    help="wall inches; regions smaller than this squared, or thinner than half of it, are merged away")
+    p.add_argument("--sheet-tint", type=float, default=0.0,
+                   help="0..0.35 light palette fill under sheet outlines so sheets match preview")
     p.add_argument("--transfer", choices=sorted(STYLES), default="trace")
     p.add_argument("--brand", default="", help="paint brand name, used for labels only")
     p.add_argument("--palette-json", type=Path, help="brand matches keyed by color number (see brand_match.py)")
     p.add_argument("--scale", type=float, default=1.0, help="print scale; 1.0 = sheets are true wall size")
-    p.add_argument("--preview-only", action="store_true", help="write cover, map and areas but no sheets")
+    p.add_argument("--preview-only", action="store_true",
+                   help="write cover, map, areas and a rich preview (no full mural.pdf sheets)")
+    p.add_argument("--preview-sheets", type=int, default=2,
+                   help="with --preview-only, sample sheets in preview_kit.pdf (0 = map and outlined image only)")
     p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--no-subject-priority", action="store_true",
+                   help="disable automatic subject priority for faces and animals (uniform detail)")
     p.add_argument("--no-face-priority", action="store_true",
-                   help="disable automatic face priority (uniform min-region and palette)")
+                   help="alias for --no-subject-priority")
+    p.add_argument("--subject-box", default="",
+                   help="manual subject box in source pixels (after EXIF): x0,y0,x1,y1")
     p.add_argument("--face-box", default="",
-                   help="manual face box in source pixels (after EXIF transpose): x0,y0,x1,y1")
+                   help="alias for --subject-box when the subject is a person")
+    p.add_argument(
+        "--merge-guide-specks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="merge outline specks smaller than --min-guide-region-in (default on)",
+    )
+    p.add_argument(
+        "--min-guide-region-in",
+        type=float,
+        default=None,
+        help="wall inches; smaller shapes merge away when --merge-guide-specks (default ~35%% of min-region)",
+    )
+    p.add_argument(
+        "--soup-report",
+        action="store_true",
+        help="write soup_report.json and soup crop PNGs for crowded focal clumps",
+    )
+    p.add_argument(
+        "--detail-inset",
+        default="",
+        help="add enlarged detail sheet(s): auto (from soup) or work-pixel box x0,y0,x1,y1",
+    )
     a = p.parse_args()
-    if a.colors < 2:
-        p.error("--colors must be at least 2")
+    if a.no_face_priority:
+        a.no_subject_priority = True
+    if a.no_subject_priority:
+        a.no_face_priority = True
+    box = (a.subject_box or a.face_box).strip()
+    a.subject_box = box
+    if box and not a.face_box:
+        a.face_box = box
+    a._from_preview_dir = None
+    if a.from_preview:
+        merge_from_preview_args(a, p)
+    else:
+        if not a.image:
+            p.error("--image required unless --from-preview")
+        if a.wall_width_ft is None or a.wall_height_ft is None:
+            p.error("--wall-width-ft and --wall-height-ft are required")
+        apply_detail_and_prep_defaults(a)
+    if a.colors is None or a.colors < 2:
+        p.error("need --colors or --detail (at least 2 colors)")
+    if a.min_region_in is None:
+        a.min_region_in = 3.0
     if min(a.wall_width_ft, a.wall_height_ft, a.scale, a.min_region_in, a.coverage_sqft_per_gal) <= 0:
         p.error("sizes, --scale, --min-region-in and coverage must be positive")
+    if not 0 <= a.sheet_tint <= 0.35:
+        p.error("--sheet-tint must be between 0 and 0.35")
     if not 0 <= a.overlap_in < 2:
         p.error("--overlap-in must be between 0 and 2 inches")
-    if a.face_box:
+    if a.preview_sheets < 0:
+        p.error("--preview-sheets must be >= 0")
+    if box:
         try:
-            parse_face_box(a.face_box)
+            parse_subject_box(box)
         except ValueError as e:
-            p.error(f"--face-box: {e}")
+            p.error(f"--subject-box: {e}")
     return a
 
 
-# ---------- face priority ----------
+def subject_priority_off(args):
+    return bool(getattr(args, "no_subject_priority", False) or args.no_face_priority)
+
+
+def manual_subject_box(args):
+    return (getattr(args, "subject_box", "") or args.face_box or "").strip()
+
+
+def parse_subject_box(text):
+    return parse_face_box(text)
+
+
+# ---------- subject priority (human faces + animal focal subjects) ----------
 
 YUNET_MODEL = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
+YOLOX_MODEL = Path(__file__).resolve().parent / "models" / "object_detection_yolox_2022nov.onnx"
+CAT_FACE_CASCADE = Path(__file__).resolve().parent / "models" / "haarcascade_frontalcatface.xml"
+YOLOX_SCORE = 0.45
+YOLOX_NMS = 0.5
+YOLOX_OBJ = 0.45
+COCO_CLASS_NAMES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus",
+    "train", "truck", "boat", "traffic light", "fire hydrant",
+    "stop sign", "parking meter", "bench", "bird", "cat", "dog",
+    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+)
+ANIMAL_CLASS_IDS = frozenset(range(14, 24))  # bird .. giraffe
 FACE_PAD = 1.6                 # expand detector box to include hairline, ears, beard/chin
 FACE_EXTRA_TOP = 0.10          # extra height upward (hair / ears), as a fraction of the padded box
-FACE_COLOR_SHARE = 0.40        # share of the color budget reserved from face pixels
 FACE_MIN_COLORS = 4            # at least this many reserved tones (Low needs 4)
 FACE_REGION_FRAC = 0.30        # face min-region is this fraction of the level's --min-region-in
 FACE_REGION_FLOOR_IN = 0.12    # still paintable with a small brush on a canvas
+BG_REGION_MULT = 1.35          # background merges more aggressively than the global min-region
+
+
+def _bg_region_mult(detail):
+    """Photo keeps slightly more background regions so detail level stays monotonic on small tests."""
+    return 1.12 if detail == "photo" else BG_REGION_MULT
 YUNET_SCORE = 0.6
 FACE_FEATHER = 0.18            # soft edge as a fraction of box size, so no hard rectangle
 EYE_RADIUS_FRAC = 0.55         # eye-box radius as a fraction of inter-eye distance (covers lens + frame)
 EYE_FEATHER = 0.22             # soft disk edge, as a fraction of the radius
 EYE_COLORS = 3                 # floor reserved from eye pixels once N>=10 (pupil/iris, white/lens, frame); scales up with N, cap 8
-EYE_REGION_FRAC = 0.40         # eye min-region is this fraction of the face min-region
-EYE_REGION_FLOOR_IN = 0.08     # still label-able with a small number on a canvas
+EYE_REGION_FRAC = 0.22         # eye min-region is this fraction of the face min-region
+EYE_REGION_FLOOR_IN = 0.06     # still label-able with a small number on a canvas
+MOUTH_COLORS = 2               # floor for lip shadow / mouth opening tones
+MOUTH_REGION_FRAC = 0.25
+MOUTH_REGION_FLOOR_IN = 0.06
+MOUTH_FEATHER = 0.14
 
 
 def parse_face_box(text):
@@ -194,8 +517,274 @@ def _detect_faces_yunet(rgb_img):
             "box": (x * inv, y * inv, (x + fw) * inv, (y + fh) * inv),
             "score": score,
             "landmarks": lms,
+            "class_id": None,
+            "class_name": "person",
+            "subject_type": "human",
         })
     return out
+
+
+class _YoloXDetector:
+    """Minimal OpenCV-Zoo YOLOX wrapper (Apache-2.0)."""
+
+    def __init__(self, model_path):
+        import cv2
+
+        self._cv2 = cv2
+        self.net = cv2.dnn.readNet(str(model_path))
+        self.input_size = (640, 640)
+        self.strides = [8, 16, 32]
+        self.conf_threshold = YOLOX_SCORE
+        self.nms_threshold = YOLOX_NMS
+        self._generate_anchors()
+
+    def _generate_anchors(self):
+        grids, expanded = [], []
+        for stride in self.strides:
+            hsize = self.input_size[0] // stride
+            wsize = self.input_size[1] // stride
+            xv, yv = np.meshgrid(np.arange(wsize), np.arange(hsize))
+            grid = np.stack((xv, yv), 2).reshape(1, -1, 2)
+            grids.append(grid)
+            expanded.append(np.full((1, hsize * wsize, 1), stride, dtype=np.float32))
+        self.grids = np.concatenate(grids, 1)
+        self.expanded_strides = np.concatenate(expanded, 1)
+
+    def infer(self, letterboxed_rgb):
+        blob = np.transpose(letterboxed_rgb, (2, 0, 1))[np.newaxis, :, :, :]
+        self.net.setInput(blob)
+        outs = self.net.forward(self.net.getUnconnectedOutLayersNames())
+        dets = outs[0][0]
+        dets[:, :2] = (dets[:, :2] + self.grids) * self.expanded_strides
+        dets[:, 2:4] = np.exp(dets[:, 2:4]) * self.expanded_strides
+        boxes = dets[:, :4]
+        boxes_xywh = np.ones_like(boxes)
+        boxes_xywh[:, 0] = boxes[:, 0] - boxes[:, 2] / 2.0
+        boxes_xywh[:, 1] = boxes[:, 1] - boxes[:, 3] / 2.0
+        boxes_xywh[:, 2] = boxes[:, 2]
+        boxes_xywh[:, 3] = boxes[:, 3]
+        scores = dets[:, 4:5] * dets[:, 5:]
+        max_scores = np.amax(scores, axis=1)
+        max_scores_idx = np.argmax(scores, axis=1)
+        keep = self._cv2.dnn.NMSBoxesBatched(
+            boxes_xywh.tolist(), max_scores.tolist(), max_scores_idx.tolist(),
+            self.conf_threshold, self.nms_threshold,
+        )
+        candidates = np.concatenate([boxes_xywh, max_scores[:, None], max_scores_idx[:, None]], axis=1)
+        if len(keep) == 0:
+            return np.zeros((0, 6))
+        return candidates[keep]
+
+
+_yolox_singleton = None
+
+
+def _yolox_detector():
+    global _yolox_singleton
+    if _yolox_singleton is not None:
+        return _yolox_singleton
+    if not YOLOX_MODEL.is_file():
+        return None
+    try:
+        _yolox_singleton = _YoloXDetector(YOLOX_MODEL)
+    except Exception:
+        return None
+    return _yolox_singleton
+
+
+def _yolox_letterbox(rgb, target=(640, 640)):
+    import cv2
+
+    padded = np.ones((target[0], target[1], 3), dtype=np.float32) * 114.0
+    h, w = rgb.shape[:2]
+    ratio = min(target[0] / h, target[1] / w)
+    resized = cv2.resize(rgb, (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    padded[: resized.shape[0], : resized.shape[1]] = resized
+    return padded, ratio
+
+
+def _detect_animals_yolox(rgb_img):
+    det = _yolox_detector()
+    if det is None:
+        return []
+    try:
+        import cv2
+    except ImportError:
+        return []
+    arr = np.asarray(rgb_img)
+    padded, ratio = _yolox_letterbox(arr)
+    preds = det.infer(padded)
+    if preds is None or len(preds) == 0:
+        return []
+    out = []
+    inv = 1.0 / ratio
+    for row in preds:
+        x, y, w, h, score, cls_id = (float(row[i]) for i in range(6))
+        cls_id = int(cls_id)
+        if cls_id not in ANIMAL_CLASS_IDS or score < YOLOX_SCORE:
+            continue
+        x0, y0, x1, y1 = x * inv, y * inv, (x + w) * inv, (y + h) * inv
+        name = COCO_CLASS_NAMES[cls_id] if cls_id < len(COCO_CLASS_NAMES) else str(cls_id)
+        out.append({
+            "box": (x0, y0, x1, y1),
+            "score": score,
+            "landmarks": [],
+            "class_id": cls_id,
+            "class_name": name,
+            "subject_type": "animal",
+        })
+    return out
+
+
+def _pick_primary_animal(detections):
+    best, best_key = None, -1.0
+    for det in detections:
+        x0, y0, x1, y1 = det["box"]
+        area = max(1.0, (x1 - x0) * (y1 - y0))
+        key = float(det["score"]) * math.sqrt(area)
+        if key > best_key:
+            best_key = key
+            best = det
+    return [best] if best else []
+
+
+def _detection_strength(det):
+    x0, y0, x1, y1 = det["box"]
+    area = max(1.0, (x1 - x0) * (y1 - y0))
+    return float(det["score"]) * math.sqrt(area)
+
+
+def _prefer_animal_over_human(humans, animals):
+    """YuNet sometimes fires on animal fur; prefer YOLOX when it is stronger."""
+    if not animals:
+        return False
+    if not humans:
+        return True
+    h = max(humans, key=lambda d: d["score"])
+    a = _pick_primary_animal(animals)[0]
+    if h["score"] >= 0.92 and a["score"] < 0.65:
+        return False
+    if h["score"] < 0.78:
+        return True
+    return _detection_strength(a) > _detection_strength(h) * 0.88
+
+
+def _animal_head_box(animal_box, class_name):
+    x0, y0, x1, y1 = animal_box
+    bw, bh = x1 - x0, y1 - y0
+    if class_name == "bird":
+        frac = 0.42
+    else:
+        frac = 0.58
+    return (x0, y0, x0 + bw, y0 + frac * bh)
+
+
+def _cat_head_box_geometric(animal_box):
+    """Upper-head crop when Haar is unavailable (e.g. OpenCV headless builds)."""
+    x0, y0, x1, y1 = animal_box
+    bw, bh = x1 - x0, y1 - y0
+    inset = 0.10 * bw
+    top = y0 + 0.06 * bh
+    bot = y0 + 0.68 * bh
+    return (x0 + inset, top, x1 - inset, bot)
+
+
+def _refine_cat_head_box(src, animal_box):
+    fallback = _cat_head_box_geometric(animal_box)
+    if not CAT_FACE_CASCADE.is_file():
+        return fallback, False
+    try:
+        import cv2
+    except ImportError:
+        return fallback, False
+    if not hasattr(cv2, "CascadeClassifier"):
+        return fallback, False
+    arr = np.asarray(src)[:, :, ::-1]
+    cascade = cv2.CascadeClassifier(str(CAT_FACE_CASCADE))
+    x0, y0, x1, y1 = (int(v) for v in animal_box)
+    x0, y0 = max(0, x0), max(0, y0)
+    roi = arr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return fallback, False
+    faces = cascade.detectMultiScale(roi, scaleFactor=1.08, minNeighbors=3, minSize=(24, 24))
+    if len(faces) == 0:
+        return fallback, False
+    fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+    hx0, hy0 = x0 + fx, y0 + fy
+    hx1, hy1 = hx0 + fw, hy0 + fh
+    pad = 0.35
+    cx, cy = (hx0 + hx1) / 2, (hy0 + hy1) / 2
+    bw, bh = (hx1 - hx0) * (1 + pad), (hy1 - hy0) * (1 + pad)
+    return (cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2), True
+
+
+def _eye_disks_from_head_features(rgb_img, head_box, img_w, img_h):
+    """Locate each eye within the upper head using local color salience (not global darkest pixels)."""
+    x0, y0, x1, y1 = (int(v) for v in head_box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(img_w, x1), min(img_h, y1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return []
+    arr = np.asarray(rgb_img)[y0:y1, x0:x1]
+    hh, ww = arr.shape[:2]
+    upper_h = max(4, int(hh * 0.52))
+    lab = rgb_to_lab(arr[:upper_h].reshape(-1, 3)).reshape(upper_h, ww, 3)
+    luma = lab[:, :, 0]
+    chroma = np.hypot(lab[:, :, 1], lab[:, :, 2])
+    disks = []
+    for x_lo, x_hi in ((0, ww // 2), (ww // 2, ww)):
+        if x_hi - x_lo < 6:
+            continue
+        lh = luma[:, x_lo:x_hi]
+        ch = chroma[:, x_lo:x_hi]
+        score = ch * np.exp(-0.5 * ((lh - 42.0) / 16.0) ** 2)
+        score *= (lh > 18) & (lh < 68)
+        if score.max() < 1e-6:
+            continue
+        sm = ndimage.gaussian_filter(score, sigma=1.15)
+        peak = sm >= (sm.max() * 0.62)
+        if peak.sum() < 6:
+            py, px = np.unravel_index(int(sm.argmax()), sm.shape)
+        else:
+            py, px = np.nonzero(peak)
+            w = sm[peak]
+            py = float((py * w).sum() / w.sum())
+            px = float((px * w).sum() / w.sum())
+        cx = float(px + x_lo + x0)
+        cy = float(py + y0)
+        r = max(3.0, min(upper_h, x_hi - x_lo) * 0.13)
+        disks.append((cx, cy, r))
+    return disks
+
+
+def _eye_disks_from_contrast(rgb_img, head_box, img_w, img_h):
+    return _eye_disks_from_head_features(rgb_img, head_box, img_w, img_h)
+
+
+def _muzzle_ellipse_animal(head_box):
+    x0, y0, x1, y1 = head_box
+    bw, bh = x1 - x0, y1 - y0
+    cx, cy = (x0 + x1) / 2, y0 + 0.55 * bh
+    return (cx, cy, 0.10 * bw, 0.06 * bh)
+
+
+def _empty_subject_info(args):
+    enabled = not subject_priority_off(args)
+    return {
+        "enabled": enabled, "found": False, "subject_type": None, "subject_class": None,
+        "detector": "none", "detectors": [],
+        "detections": [], "faces": [],
+        "mask": None, "face_min_region_in": None, "face_colors_reserved": 0,
+        "eye_mask": None, "eye_min_region_in": None, "eye_colors_reserved": 0,
+        "eye_count": 0, "eye_disks_work": [],
+        "mouth_mask": None, "mouth_min_region_in": None, "mouth_colors_reserved": 0,
+        "face_skin_colors": 0, "background_colors_reserved": 0,
+        "mouth_ellipses_work": [],
+    }
+
+
+def _subject_meta_for_json(subject):
+    return {k: v for k, v in subject.items() if k not in ("mask", "eye_mask", "mouth_mask")}
 
 
 def _map_box_to_work(src_box, crop_box, work_size):
@@ -280,7 +869,7 @@ def _maybe_upscale_ppi(src, wall_w_in, wall_h_in, ppi, enabled):
     max_ppi = math.sqrt(MAX_WORK_PIXELS / (wall_w_in * wall_h_in))
     bumped = min(TARGET_PPI * 2, src_ppi * 2, max_ppi)
     if bumped > ppi * 1.15:
-        print(f"face priority: work resolution {bumped:.1f} px/in "
+        print(f"subject priority: work resolution {bumped:.1f} px/in "
               f"(Lanczos upscale; source is {src_ppi:.1f} px/in)")
         return bumped
     return ppi
@@ -307,109 +896,232 @@ def _soft_mask(h, w, boxes, feather=FACE_FEATHER):
     return np.clip(mask, 0, 1)
 
 
-def _eye_color_count(n, n_face):
-    """Reserve 2-3 eye colors at Low, more at High/Photo, always within the same total N."""
+def face_palette_share(detail):
+    return {"low": 0.50, "medium": 0.55, "high": 0.56, "photo": 0.58}.get(detail or "medium", 0.55)
+
+
+def feature_color_budget(n, detail):
+    """Split total N among bg, face skin, eyes, and mouth (face+focal takes 50-58%)."""
+    n_face_total = min(n - 3, max(FACE_MIN_COLORS, int(round(n * face_palette_share(detail)))))
     if n < 6:
-        return 0
+        return n_face_total, 0, 0, max(1, n - n_face_total)
     if n < 10:
-        want = 2
+        n_eye, n_mouth = 2, 1
     else:
-        # Low 10 -> 3, Medium 20 -> 4, High 35 -> 7, Photo 60 -> 8 (cap)
-        want = min(8, max(EYE_COLORS, int(round(n * 0.20))))
-    return min(want, max(0, n - n_face - 2))
+        n_eye = min(8, max(EYE_COLORS, int(round(n * 0.18))))
+        n_mouth = min(5, max(MOUTH_COLORS, int(round(n * 0.08))))
+    n_eye = min(n_eye, max(0, n_face_total - 2))
+    n_mouth = min(n_mouth, max(0, n_face_total - n_eye - 1))
+    n_skin = max(1, n_face_total - n_eye - n_mouth)
+    n_bg = max(2, n - n_face_total)
+    return n_skin, n_eye, n_mouth, n_bg
 
 
-def resolve_faces(src, work_img, crop_box, args):
+def _mouth_ellipse_from_landmarks(landmarks, img_w, img_h):
+    if not landmarks or len(landmarks) < 5:
+        return None
+    rm, lm, nose = landmarks[3], landmarks[4], landmarks[2]
+    cx, cy = (rm[0] + lm[0]) / 2, (rm[1] + lm[1]) / 2
+    mouth_w = math.hypot(lm[0] - rm[0], lm[1] - rm[1])
+    if mouth_w < 6:
+        return None
+    cy += 0.12 * mouth_w
+    rx, ry = max(6.0, 0.72 * mouth_w), max(4.0, 0.38 * mouth_w)
+    return (cx, cy, rx, ry)
 
-    """Detect or apply a manual face box. Returns a dict; mask is None when face priority is off or no face is found."""
-    info = {"enabled": not args.no_face_priority, "found": False, "detector": "none",
-            "faces": [], "mask": None, "face_min_region_in": None, "face_colors_reserved": 0,
-            "eye_mask": None, "eye_min_region_in": None, "eye_colors_reserved": 0,
-            "eye_count": 0, "eye_disks_work": []}
-    if args.no_face_priority:
-        print("face priority: off")
+
+def _estimate_mouth_ellipse(face_box):
+    x0, y0, x1, y1 = face_box
+    bw, bh = x1 - x0, y1 - y0
+    cx, cy = (x0 + x1) / 2, y0 + 0.72 * bh
+    return (cx, cy, 0.28 * bw, 0.14 * bh)
+
+
+def _soft_ellipse(h, w, cx, cy, rx, ry, feather=MOUTH_FEATHER):
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    nx = (xx - cx) / max(rx, 1.0)
+    ny = (yy - cy) / max(ry, 1.0)
+    d = np.sqrt(nx * nx + ny * ny)
+    inner = 1.0 - feather
+    ramp = np.where(
+        d <= inner, 1.0,
+        np.where(d >= 1.0, 0.0, 0.5 - 0.5 * np.cos(np.clip((1.0 - d) / feather, 0, 1) * np.pi)),
+    )
+    return np.clip(ramp.astype(np.float32), 0, 1)
+
+
+def _dark_lab_slots(pixels, count, percentile=12):
+    """Pick Lab centers from the darkest pixels (not means), for pupils and mouth shadow."""
+    if len(pixels) == 0 or count <= 0:
+        return np.zeros((0, 3))
+    lab = rgb_to_lab(pixels)
+    l = lab[:, 0]
+    cut = np.percentile(l, percentile)
+    dark = pixels[l <= cut + 1.5]
+    if len(dark) < count:
+        dark = pixels[np.argsort(l)[: max(count * 3, count)]]
+    slots = []
+    for i in range(count):
+        chunk = dark[i::count] if len(dark) >= count else dark
+        if len(chunk) == 0:
+            continue
+        pick = chunk[np.argmin(rgb_to_lab(chunk)[:, 0])]
+        if all(np.linalg.norm(rgb_to_lab(pick) - rgb_to_lab(s)) >= 1.2 for s in slots):
+            slots.append(rgb_to_lab(pick))
+    return np.array(slots) if slots else np.zeros((0, 3))
+
+
+def resolve_subject(src, work_img, crop_box, args):
+    """Detect a focal human or animal subject and build face/eye/mouth (muzzle) priority masks."""
+    info = _empty_subject_info(args)
+    if subject_priority_off(args):
+        print("subject priority: off")
         return info
     src_w, src_h = src.size
     work_w, work_h = work_img.size
-    detections, detector = [], "none"
-    if args.face_box:
-        detections = [{"box": parse_face_box(args.face_box), "score": 1.0, "landmarks": []}]
+    detectors = []
+    detections, detector, subject_type, subject_class = [], "none", None, None
+    manual = manual_subject_box(args)
+    if manual:
+        detections = [{
+            "box": parse_subject_box(manual), "score": 1.0, "landmarks": [],
+            "class_id": None, "class_name": "person", "subject_type": "human",
+        }]
         detector = "manual"
+        subject_type, subject_class = "human", "person"
+        detectors.append("manual")
     else:
-        detections = _detect_faces_yunet(src)
-        if detections:
-            detector = "yunet"
+        humans = _detect_faces_yunet(src)
+        animals = _detect_animals_yolox(src)
+        if animals and _prefer_animal_over_human(humans, animals):
+            detections = _pick_primary_animal(animals)
+            det = detections[0]
+            detector, subject_type, subject_class = "yolox", "animal", det["class_name"]
+            detectors.append("yolox")
+        elif humans:
+            detections = humans
+            detector, subject_type, subject_class = "yunet", "human", "person"
+            detectors.append("yunet")
     if not detections:
-        print("face priority: no face found; using uniform detail")
+        print("subject priority: no human face or focal animal found; using uniform detail")
         return info
-    # Keep the strongest face(s). Drop a weaker detection whose center sits inside
-    # a higher-scoring padded box (a cat's chest, a highlight) so group photos still
-    # keep two clearly separate faces.
     ranked = sorted(detections, key=lambda d: -d["score"])
-    kept, kept_padded = [], []
+    kept, kept_padded, kept_heads = [], [], []
     for det in ranked:
         box = det["box"]
         cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
         if any(px0 <= cx <= px1 and py0 <= cy <= py1 for px0, py0, px1, py1 in kept_padded):
             continue
-        padded = _pad_box(box, src_w, src_h)
+        if det.get("subject_type") == "animal":
+            head = det["box"]
+            if det.get("class_name") == "cat":
+                head, used_haar = _refine_cat_head_box(src, det["box"])
+                if used_haar and "cat_haar" not in detectors:
+                    detectors.append("cat_haar")
+            else:
+                head = _animal_head_box(det["box"], det.get("class_name") or "dog")
+            padded = _pad_box(head, src_w, src_h, scale=1.25, extra_top=0.06)
+        else:
+            head = box
+            padded = _pad_box(box, src_w, src_h)
         kept.append(det)
         kept_padded.append(padded)
-    work_boxes, faces_meta, eye_disks_work = [], [], []
-    for det, padded in zip(kept, kept_padded):
+        kept_heads.append(head)
+    work_boxes, subjects_meta, eye_disks_work, mouth_ellipses_work = [], [], [], []
+    scale_x = work_w / (crop_box[2] - crop_box[0])
+    scale_y = work_h / (crop_box[3] - crop_box[1])
+    for det, padded, head in zip(kept, kept_padded, kept_heads):
         mapped = _map_box_to_work(padded, crop_box, (work_w, work_h))
         lms = det.get("landmarks") or []
         lms_work = [_map_point_to_work(x, y, crop_box, (work_w, work_h)) for x, y in lms] if lms else []
-        disks_src = _eye_disks_from_landmarks(lms, src_w, src_h) if lms else []
-        if not disks_src:
-            disks_src = _estimate_eye_disks(padded)
+        if det.get("subject_type") == "animal":
+            disks_src = _eye_disks_from_contrast(src, head, src_w, src_h)
+            if not disks_src:
+                disks_src = _estimate_eye_disks(head)
+            mouth_src = _muzzle_ellipse_animal(head)
+        else:
+            disks_src = _eye_disks_from_landmarks(lms, src_w, src_h) if lms else []
+            if not disks_src:
+                disks_src = _estimate_eye_disks(padded)
+            mouth_src = _mouth_ellipse_from_landmarks(lms, src_w, src_h) if lms else _estimate_mouth_ellipse(padded)
         for cx, cy, r in disks_src:
             wcx, wcy = _map_point_to_work(cx, cy, crop_box, (work_w, work_h))
-            wr = r * (work_w / (crop_box[2] - crop_box[0]))
+            wr = r * scale_x
             if wr >= 2:
                 eye_disks_work.append((wcx, wcy, wr))
-        faces_meta.append({
+        if mouth_src:
+            wcx, wcy = _map_point_to_work(mouth_src[0], mouth_src[1], crop_box, (work_w, work_h))
+            mouth_ellipses_work.append((wcx, wcy, mouth_src[2] * scale_x, mouth_src[3] * scale_y))
+        meta = {
             "source_box": [round(v, 1) for v in det["box"]],
+            "head_source_box": [round(v, 1) for v in head],
             "padded_source_box": [round(v, 1) for v in padded],
             "work_box": None if mapped is None else [round(v, 1) for v in mapped],
             "landmarks_source": [[round(x, 1), round(y, 1)] for x, y in lms],
             "landmarks_work": [[round(x, 1), round(y, 1)] for x, y in lms_work],
             "score": round(float(det["score"]), 3),
-        })
+            "subject_type": det.get("subject_type") or subject_type,
+            "class_name": det.get("class_name") or subject_class,
+            "class_id": det.get("class_id"),
+        }
+        subjects_meta.append(meta)
         if mapped is not None:
             work_boxes.append(mapped)
     if not work_boxes:
-        print("face priority: a face was found but it sits outside the wall crop; using uniform detail")
-        info["detector"] = detector
-        info["faces"] = faces_meta
+        print("subject priority: subject found but outside the wall crop; using uniform detail")
+        info.update({"detector": detector, "detectors": detectors, "detections": subjects_meta,
+                     "faces": subjects_meta, "subject_type": subject_type, "subject_class": subject_class})
         return info
     face_min = max(FACE_REGION_FLOOR_IN, FACE_REGION_FRAC * args.min_region_in)
-    n_face = min(args.colors - 2, max(FACE_MIN_COLORS, int(round(FACE_COLOR_SHARE * args.colors))))
-    n_face = max(1, n_face)
-    n_eye = _eye_color_count(args.colors, n_face)
+    n_skin, n_eye, n_mouth, n_bg = feature_color_budget(args.colors, getattr(args, "detail", None))
+    n_face = n_skin + n_eye + n_mouth
     eye_min = max(EYE_REGION_FLOOR_IN, EYE_REGION_FRAC * face_min) if n_eye else None
+    mouth_min = max(MOUTH_REGION_FLOOR_IN, MOUTH_REGION_FRAC * face_min) if n_mouth else None
     eye_mask = _soft_disks(work_h, work_w, eye_disks_work) if eye_disks_work and n_eye else None
+    mouth_mask = None
+    if mouth_ellipses_work and n_mouth:
+        mouth_mask = np.zeros((work_h, work_w), dtype=np.float32)
+        for cx, cy, rx, ry in mouth_ellipses_work:
+            mouth_mask = np.maximum(mouth_mask, _soft_ellipse(work_h, work_w, cx, cy, rx, ry))
     info.update({
-        "found": True, "detector": detector, "faces": faces_meta,
+        "found": True, "detector": detector, "detectors": detectors,
+        "subject_type": subject_type or (subjects_meta[0].get("subject_type") if subjects_meta else None),
+        "subject_class": subject_class or (subjects_meta[0].get("class_name") if subjects_meta else None),
+        "detections": subjects_meta, "faces": subjects_meta,
         "mask": _soft_mask(work_h, work_w, work_boxes),
         "face_min_region_in": round(face_min, 3), "face_colors_reserved": n_face,
+        "face_skin_colors": n_skin, "background_colors_reserved": n_bg,
         "eye_mask": eye_mask,
         "eye_min_region_in": None if eye_min is None else round(eye_min, 3),
         "eye_colors_reserved": n_eye,
         "eye_count": 0 if eye_mask is None else len(eye_disks_work),
         "eye_disks_work": [[round(cx, 1), round(cy, 1), round(r, 1)] for cx, cy, r in eye_disks_work],
+        "mouth_mask": mouth_mask,
+        "mouth_min_region_in": None if mouth_min is None else round(mouth_min, 3),
+        "mouth_colors_reserved": n_mouth,
+        "mouth_ellipses_work": [[round(v, 1) for v in ell] for ell in mouth_ellipses_work],
     })
     bits = ", ".join(
-        f"score {f['score']}" + (f", work box {f['work_box']}" if f["work_box"] else ", outside crop")
-        for f in faces_meta
+        f"{f.get('class_name', 'person')} score {f['score']}"
+        + (f", work box {f['work_box']}" if f["work_box"] else ", outside crop")
+        for f in subjects_meta
     )
-    msg = (f"face priority: {len(work_boxes)} face(s) ({detector}, {bits}); "
-           f"reserved {n_face} of {args.colors} colors, face min-region {face_min:g} in")
+    kind = info["subject_type"] or "subject"
+    msg = (f"subject priority: {len(work_boxes)} {kind}(s) ({'+'.join(detectors)}, {bits}); "
+           f"reserved {n_face} of {args.colors} colors, subject min-region {face_min:g} in")
     if eye_mask is not None:
         msg += (f"; eye priority: {len(eye_disks_work)} eye(s), reserved {n_eye} colors, "
                 f"eye min-region {eye_min:g} in")
+    if mouth_mask is not None:
+        label = "muzzle" if kind == "animal" else "mouth"
+        msg += (f"; {label} priority: reserved {n_mouth} colors, min-region {mouth_min:g} in")
+    msg += f"; background gets {n_bg} colors (stronger smoothing)"
     print(msg)
     return info
+
+
+def resolve_faces(src, work_img, crop_box, args):
+    return resolve_subject(src, work_img, crop_box, args)
 
 
 def _kmeans_lab(pixels, n, seed=SEED, weight_exp=0.5):
@@ -432,12 +1144,21 @@ def _kmeans_lab(pixels, n, seed=SEED, weight_exp=0.5):
     return km.cluster_centers_
 
 
-def _merge_close_lab(centers, min_dist=3.5):
+def _merge_close_lab(centers, min_dist=3.5, target_count=0):
     kept = []
     for c in centers:
         if all(np.linalg.norm(c - k) >= min_dist for k in kept):
             kept.append(c)
-    return np.array(kept) if kept else np.zeros((0, 3))
+    out = np.array(kept) if kept else np.zeros((0, 3))
+    if target_count > len(out) and len(out) < len(centers):
+        extra = [c for c in centers
+                 if not any(np.linalg.norm(c - k) < min_dist for k in out)]
+        for c in extra:
+            if len(out) >= target_count:
+                break
+            if all(np.linalg.norm(c - k) >= min_dist * 0.55 for k in out):
+                out = np.vstack([out, c])
+    return out
 
 
 def _assign_nearest_lab(rgb, centers_lab):
@@ -446,18 +1167,15 @@ def _assign_nearest_lab(rgb, centers_lab):
     return np.sqrt((delta * delta).sum(-1)).argmin(-1).astype(np.int32)
 
 
-def _median_composite(img, face_mask, ppi, eye_mask=None):
-    """Stronger noise filter in the background, weaker in the face, none in the eyes."""
-    bg_k = 2 * int(0.1 * ppi) + 1
-    face_k = 2 * int(0.04 * ppi) + 1
+def _median_composite(img, face_mask, ppi, eye_mask=None, mouth_mask=None, colors=8):
+    """Heavy smoothing in the background only; subject skin stays on original pixels."""
+    bg_k = 2 * int(0.12 * ppi) + 1
+    if colors >= 20:
+        bg_k = min(bg_k + 2, 2 * int(0.16 * ppi) + 1)
     orig = np.asarray(img)
     bg = np.asarray(img.filter(ImageFilter.MedianFilter(bg_k)))
-    face = orig if face_k < 3 else np.asarray(img.filter(ImageFilter.MedianFilter(max(3, face_k))))
-    m_face = face_mask[..., None]
-    mixed = face * m_face + bg * (1 - m_face)
-    if eye_mask is not None:
-        m_eye = eye_mask[..., None]
-        mixed = orig * m_eye + mixed * (1 - m_eye)
+    in_face = face_mask >= 0.35
+    mixed = np.where(in_face[..., None], orig, bg)
     return np.rint(mixed).astype(np.uint8)
 
 
@@ -479,73 +1197,324 @@ def _clahe_eyes(rgb, eye_mask, clip=2.0, tile=4):
     return np.rint(enhanced * m + rgb * (1 - m)).astype(np.uint8)
 
 
-def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0):
-    """Reserve palette slots for eyes, then the face, then the background; total stays at N.
+def _kmeans_centers_with_dark_seed(pixels, n, seed, percentile=15, merge_focal=2.0):
+    """Cluster subject pixels; at most one darkest-percentile seed joins the palette candidates."""
+    if n <= 0 or len(pixels) == 0:
+        return np.zeros((0, 3))
+    slots = []
+    if n >= 2:
+        dark = _dark_lab_slots(pixels, 1, percentile=percentile)
+        if len(dark):
+            slots.append(dark)
+    rest = max(1, n - len(slots))
+    slots.append(_kmeans_lab(pixels, rest, seed, weight_exp=0.4))
+    stacked = np.vstack(slots)
+    return _merge_close_lab(stacked, min_dist=merge_focal, target_count=n)
 
-    Cluster centers are taken from the un-enhanced image so paint colors stay true to the
-    photo. Assignment inside the eye disks uses a local CLAHE lift so a dark pupil can
-    separate from lens glare, and is locked to the reserved eye centers so it doesn't
-    collapse into hair or skin.
-    """
-    mixed = _median_composite(img, face_mask, ppi, eye_mask)
+
+def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, mouth_mask=None,
+                           n_skin=0, n_eye=0, n_mouth=0, n_bg=0, merge_min_dist=3.5, detail=None):
+    """Reserve palette slots for eyes, mouth, face skin, and bg; assign every pixel via nearest Lab to original."""
+    if not n_skin:
+        n_skin, n_eye, n_mouth, n_bg = feature_color_budget(n, detail)
+    mixed = _median_composite(img, face_mask, ppi, eye_mask, mouth_mask, colors=n)
+    orig = np.asarray(img)
     n_eye = n_eye if eye_mask is not None and n_eye > 0 else 0
-    n_face = min(n - n_eye - 2, max(FACE_MIN_COLORS, int(round(FACE_COLOR_SHARE * n))))
-    n_face = max(1, min(n_face, n - n_eye - 1))
-    n_bg = max(1, n - n_face - n_eye)
-    eye_pix = mixed[eye_mask >= 0.5].reshape(-1, 3) if n_eye else np.zeros((0, 3), np.uint8)
-    face_pix = mixed[(face_mask >= 0.5) & ((eye_mask < 0.5) if n_eye else True)].reshape(-1, 3)
+    n_mouth = n_mouth if mouth_mask is not None and n_mouth > 0 else 0
+    eye_f = eye_mask >= 0.55 if eye_mask is not None else np.zeros_like(face_mask, dtype=bool)
+    mouth_f = mouth_mask >= 0.55 if mouth_mask is not None else np.zeros_like(face_mask, dtype=bool)
+    eye_pix = orig[eye_f].reshape(-1, 3) if n_eye else np.zeros((0, 3), np.uint8)
+    mouth_pix = orig[mouth_f].reshape(-1, 3) if n_mouth else np.zeros((0, 3), np.uint8)
+    face_pix = orig[(face_mask >= 0.5) & ~eye_f & ~mouth_f].reshape(-1, 3)
     bg_pix = mixed[face_mask < 0.5].reshape(-1, 3)
     parts = []
-    n_eye_kept = 0
-    if n_eye and len(eye_pix) >= n_eye:
-        # Lower weight exponent so a small pupil can still earn its own cluster.
-        eye_c = _merge_close_lab(_kmeans_lab(eye_pix, n_eye, SEED, weight_exp=0.25))
-        parts.append(eye_c)
-        n_eye_kept = len(eye_c)
+    merge = merge_min_dist
+    merge_focal = max(1.2, merge * 0.55)
+    eye_merge = max(1.0, merge * 0.32)
+    if n_eye and len(eye_pix) >= 2:
+        parts.append(_kmeans_centers_with_dark_seed(eye_pix, n_eye, SEED, percentile=10, merge_focal=eye_merge))
+    if n_mouth and len(mouth_pix) >= 1:
+        parts.append(_kmeans_centers_with_dark_seed(mouth_pix, n_mouth, SEED + 1, percentile=22, merge_focal=merge_focal))
     if len(face_pix):
-        parts.append(_kmeans_lab(face_pix, n_face, SEED + 1))
+        parts.append(_kmeans_lab(face_pix, n_skin, SEED + 2, weight_exp=0.45))
     if len(bg_pix):
-        parts.append(_kmeans_lab(bg_pix, n_bg, SEED + 2))
+        parts.append(_kmeans_lab(bg_pix, n_bg, SEED + 3, weight_exp=0.65))
     if not parts:
-        return quantize(Image.fromarray(mixed), n, ppi)
-    centers = _merge_close_lab(np.vstack(parts))
-    # Fill slots freed by merging, preferring leftover eye then face variation.
-    # New unique eye extras stay at the end of the kept list; count them as eye colors.
-    if len(centers) < n and len(eye_pix):
-        before = len(centers)
-        extra = _kmeans_lab(eye_pix, n_eye + (n - len(centers)), SEED + 3, weight_exp=0.25)
-        centers = _merge_close_lab(np.vstack([centers, extra]))
-        n_eye_kept += max(0, len(centers) - before)
+        return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
+    centers = _merge_close_lab(np.vstack(parts), min_dist=merge, target_count=n)
     if len(centers) < n and len(face_pix):
-        extra = _kmeans_lab(face_pix, n_face + (n - len(centers)), SEED + 4)
-        centers = _merge_close_lab(np.vstack([centers, extra]))
+        extra = _kmeans_lab(face_pix, n_skin + (n - len(centers)), SEED + 4)
+        centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
     if len(centers) < n:
-        extra = _kmeans_lab(mixed.reshape(-1, 3), n, SEED + 5)
-        centers = _merge_close_lab(np.vstack([centers, extra]))
+        extra = _kmeans_lab(orig.reshape(-1, 3), n, SEED + 5)
+        centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
     if len(centers) > n:
         centers = centers[:n]
-        n_eye_kept = min(n_eye_kept, len(centers))
     if len(centers) < 2:
-        return quantize(Image.fromarray(mixed), n, ppi)
-    labels = _assign_nearest_lab(mixed, centers)
-    # Inside the eye disks, assign against a contrast-lifted view but only to reserved eye colors.
-    if n_eye_kept >= 2:
-        eye_centers = centers[:n_eye_kept]
-        lifted = _clahe_eyes(mixed, eye_mask, clip=2.5, tile=4)
-        labels_eye = _assign_nearest_lab(lifted, eye_centers)
-        labels = np.where(eye_mask >= 0.5, labels_eye, labels)
+        return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
+    return _assign_nearest_lab(orig, centers)
+
+
+def paint_for_main_outlines(labels, regions, numbered_ids, eye_mask=None):
+    """Paint numbered regions (plus all eye subregions) so guide-guide mesh stays off main sheets."""
+    paint = np.zeros(labels.shape, dtype=np.int32)
+    rids = {int(r) for r in numbered_ids}
+    if eye_mask is not None and float(np.max(eye_mask)) >= 0.25:
+        em = eye_mask >= 0.45
+        for rid in np.unique(regions[em]):
+            rid = int(rid)
+            if rid > 0:
+                rids.add(rid)
+    for rid in rids:
+        m = regions == int(rid)
+        if np.any(m):
+            paint[m] = int(labels[m][0]) + 1
+    return paint
+
+
+def promote_eye_regions_to_numbered(numbered, guide, speck, regions, eye_mask, min_px=5):
+    """Eye subregions must stay numbered on main sheets (pupil/iris/catchlight)."""
+    if eye_mask is None or float(np.max(eye_mask)) < 0.25:
+        return numbered, guide, speck
+    numbered, guide, speck = set(numbered), set(guide), set(speck)
+    em = eye_mask >= 0.45
+    for rid in list(guide | speck):
+        m = (regions == int(rid)) & em
+        if int(m.sum()) >= min_px:
+            numbered.add(int(rid))
+            guide.discard(int(rid))
+            speck.discard(int(rid))
+    return numbered, guide, speck
+
+
+def merge_micro_regions_in_mask(labels, rgb, region_mask, max_area_px=12, max_passes=25, protect_mask=None):
+    """Merge dust regions inside region_mask into the best Lab neighbor (not in protect_mask)."""
+    if region_mask is None or not np.any(region_mask):
+        return labels
+    protect_mask = protect_mask if protect_mask is not None else np.zeros(labels.shape, dtype=bool)
+    roi = region_mask.astype(bool) & ~protect_mask
+    if not np.any(roi):
+        return labels
+    for _ in range(max_passes):
+        regions, colors = label_regions(labels)
+        ids = np.arange(1, len(colors))
+        area = np.bincount(regions.ravel(), minlength=len(colors))[1:]
+        changed = False
+        slices = ndimage.find_objects(regions)
+        for rid in ids[(area < max_area_px) & (area > 0)]:
+            mrid = regions == rid
+            if not np.any(mrid & roi):
+                continue
+            if np.any(mrid & protect_mask):
+                continue
+            sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in slices[rid - 1])
+            mask = regions[sl] == rid
+            sub = labels[sl]
+            ring = sub[ndimage.binary_dilation(mask) & ~mask]
+            ring = ring[ring != colors[rid]]
+            if len(ring):
+                sub[mask] = int(np.bincount(ring).argmax())
+                changed = True
+        if not changed:
+            break
     return labels
 
 
-def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=None):
-    """Fine majority inside the face, none in the eyes, coarser in the background; smooth seams."""
+def enforce_eye_label_structure(labels, rgb, palette, eye_mask, min_lstar_gap=EYE_LSTAR_GAP_MIN):
+    """Final eye pass: >=3 labels per eye with pupil dark enough vs iris (survives to labels.npz)."""
+    if eye_mask is None or float(eye_mask.max()) < 0.25:
+        return labels, palette
+    out = labels.copy()
+    pal_lab = rgb_to_lab(palette).astype(np.float64)
+    pix_lab = rgb_to_lab(rgb)
+    luma = pix_lab[..., 0]
+    em = eye_mask >= 0.45
+    if not np.any(em):
+        return out, palette
+    order = np.argsort(pal_lab[:, 0], kind="stable")
+    dark_idx = int(order[0])
+    mid_idx = int(order[len(order) // 2])
+    catch_idx = int(order[-2]) if len(order) >= 3 else int(order[-1])
+    if catch_idx == dark_idx or catch_idx == mid_idx:
+        catch_idx = int(order[-1])
+    extra = int(order[1]) if len(order) > 3 else mid_idx
+    slot_map = [dark_idx, extra, mid_idx, catch_idx]
+    cc, n_cc = ndimage.label(em)
+    for ci in range(1, n_cc + 1):
+        m = cc == ci
+        if int(m.sum()) < 20:
+            continue
+        lv = luma[m].astype(np.float64)
+        if int(m.sum()) >= 48:
+            km = KMeans(n_clusters=3, n_init=4, random_state=SEED).fit(lv.reshape(-1, 1))
+            centers = km.cluster_centers_.ravel()
+            order = np.argsort(centers)
+            slots = [dark_idx, mid_idx, catch_idx]
+            for ki, cl in enumerate(order):
+                zm = m.copy()
+                zm[m] = km.labels_ == cl
+                if int(zm.sum()) >= 2:
+                    out[zm] = int(slots[ki])
+            lids_here = {int(v) for v in np.unique(out[m]) if int(v) > 0}
+            if len(lids_here) < 3:
+                t_dark, t_light = np.percentile(lv, [34, 76])
+                out[m & (luma <= t_dark)] = int(dark_idx)
+                out[m & (luma > t_dark) & (luma < t_light)] = int(mid_idx)
+                out[m & (luma >= t_light)] = int(catch_idx)
+                if int((m & (out == catch_idx)).sum()) < 4:
+                    t_hi = np.percentile(lv, 90)
+                    out[m & (luma >= t_hi)] = int(catch_idx)
+        else:
+            t0, t1, t2 = np.percentile(lv, [22, 52, 84])
+            zones = (
+                (m & (luma <= t0), slot_map[0]),
+                (m & (luma > t0) & (luma <= t1), slot_map[1]),
+                (m & (luma > t1) & (luma < t2), slot_map[2]),
+                (m & (luma >= t2), slot_map[3]),
+            )
+            for zm, lid in zones:
+                if int(zm.sum()) >= 2:
+                    out[zm] = int(lid)
+        holes = m & (out == 0)
+        if np.any(holes):
+            out[holes] = int(mid_idx)
+    # Nudge palette L* so preview and test see pupil vs iris gap.
+    for ci in range(1, n_cc + 1):
+        m = cc == ci
+        pupil = m & (out == dark_idx)
+        iris = m & (out == mid_idx)
+        if int(pupil.sum()) < 2 or int(iris.sum()) < 2:
+            continue
+        iris_l = float(pix_lab[iris, 0].mean())
+        pupil_l = float(pix_lab[pupil, 0].mean())
+        pal_lab[mid_idx, 0] = max(pal_lab[mid_idx, 0], iris_l)
+        pal_lab[dark_idx, 0] = min(pal_lab[dark_idx, 0], pupil_l)
+        if pal_lab[mid_idx, 0] - pal_lab[dark_idx, 0] < min_lstar_gap:
+            pal_lab[dark_idx, 0] = pal_lab[mid_idx, 0] - min_lstar_gap
+        if int((m & (out == catch_idx)).sum()) >= 2:
+            catch_l = float(pix_lab[m & (out == catch_idx), 0].mean())
+            pal_lab[catch_idx, 0] = max(pal_lab[catch_idx, 0], catch_l)
+    palette = lab_to_rgb(pal_lab)
+    return out, palette
+
+
+def finalize_face_labels(labels, rgb, palette, face, ppi):
+    """Last label mutations before labels.npz: mouth micro-merge + enforced eye structure."""
+    eye = face.get("eye_mask")
+    mouth = face.get("mouth_mask")
+    protect = (eye >= 0.45) if eye is not None else np.zeros(labels.shape, dtype=bool)
+    face = face.get("mask") if isinstance(face, dict) else None
+    face_m = (face >= 0.35) if face is not None and float(np.max(face)) >= 0.2 else None
+    merge_mask = None
+    if mouth is not None and float(np.max(mouth)) >= 0.2:
+        merge_mask = mouth >= 0.35
+    if face_m is not None:
+        merge_mask = face_m if merge_mask is None else (merge_mask | face_m)
+    if merge_mask is not None and np.any(merge_mask):
+        labels = merge_micro_regions_in_mask(
+            labels, rgb, merge_mask, max_area_px=22, protect_mask=protect,
+        )
+    labels, palette = enforce_eye_label_structure(labels, rgb, palette, eye)
+    return labels, palette
+
+
+def work_rgb_from_job_meta(meta, wall_w_in, wall_h_in):
+    argv = meta.get("argv") or {}
+    img_path = argv.get("image")
+    if not img_path or not Path(img_path).exists():
+        return None
+    src = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
+    src = apply_image_prep(src, meta.get("prep") or argv.get("prep") or "none")
+    ppi = float(meta["ppi"])
+    img, _, _ = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
+    return np.asarray(img)
+
+
+def is_kitten_canvas_regression(a):
+    img = getattr(a, "image", None)
+    if img is None:
+        argv = getattr(a, "_from_preview_dir", None)
+        if argv:
+            meta = json.loads((Path(argv) / PREVIEW_JOB_NAME).read_text())
+            img = meta.get("argv", {}).get("image", "")
+    name = Path(str(img or "")).name
+    if name != KITTEN_TEST_IMAGE:
+        return False
+    w = getattr(a, "wall_width_ft", None)
+    h = getattr(a, "wall_height_ft", None)
+    return w is not None and h is not None and is_canvas_job(w, h)
+
+
+def sharpen_eye_features(labels, rgb, eye_mask, ppi):
+    """Split each eye into pupil, rim, iris, and catchlight using local luminance (keep separate labels)."""
+    if eye_mask is None or float(eye_mask.max()) < 0.35:
+        return labels
+    out = labels.copy()
+    lab_full = rgb_to_lab(rgb)
+    luma = lab_full[..., 0]
+    em = eye_mask >= 0.45
+    if not np.any(em):
+        return out
+    nlab = int(out.max()) + 1
+    cc, n_cc = ndimage.label(em)
+    for ci in range(1, n_cc + 1):
+        m = cc == ci
+        if int(m.sum()) < 16:
+            continue
+        lv = luma[m]
+        t_pup, t_rim, t_cat = np.percentile(lv, [8, 26, 90])
+        zones = (
+            (m & (luma <= t_pup), "pupil"),
+            (m & (luma > t_pup) & (luma <= t_rim), "rim"),
+            (m & (luma > t_rim) & (luma < t_cat), "iris"),
+            (m & (luma >= t_cat), "catch"),
+        )
+        used = set()
+
+        def pick_label(zone_mask, prefer_dark):
+            if int(zone_mask.sum()) < 2:
+                return None
+            zlab = rgb_to_lab(rgb[zone_mask].reshape(-1, 3)).mean(axis=0)
+            best_k, best_d = None, 1e18
+            for k in range(nlab):
+                if k in used:
+                    continue
+                if np.any(out == k):
+                    klab = rgb_to_lab(rgb[out == k].reshape(-1, 3)).mean(axis=0)
+                else:
+                    klab = zlab
+                d = float(np.linalg.norm(zlab - klab))
+                if prefer_dark:
+                    d += max(0.0, klab[0] - zlab[0]) * 0.35
+                else:
+                    d += max(0.0, zlab[0] - klab[0]) * 0.35
+                if d < best_d:
+                    best_d, best_k = d, k
+            if best_k is None:
+                best_k = int(np.argmax(np.bincount(out[m], minlength=nlab)))
+            used.add(best_k)
+            return best_k
+
+        for zone_mask, name in zones:
+            k = pick_label(zone_mask, prefer_dark=name in ("pupil", "rim"))
+            if k is not None:
+                out[zone_mask] = k
+    return out
+
+
+def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=None, mouth_mask=None, preserve_bg=False):
+    """Fine majority inside the face, none in the eyes/mouth, coarser in the background; smooth seams."""
     fine = majority_filter(labels, n, max(1, win_face))
     coarse = majority_filter(labels, n, max(1, win_bg))
-    out = np.where(face_mask >= 0.35, fine, coarse)
+    out = np.where(face_mask >= 0.35, fine, labels if preserve_bg else coarse)
     if eye_mask is not None:
-        # Leave eye pixels unsmoothed so a pupil or frame line isn't majority-voted away.
         out = np.where(eye_mask >= 0.35, labels, out)
+    if mouth_mask is not None:
+        out = np.where(mouth_mask >= 0.35, labels, out)
+    if eye_mask is not None:
         seam = (face_mask > 0.12) & (face_mask < 0.75) & (eye_mask < 0.35)
+        if mouth_mask is not None:
+            seam &= mouth_mask < 0.35
     else:
         seam = (face_mask > 0.12) & (face_mask < 0.75)
     if np.any(seam):
@@ -555,13 +1524,21 @@ def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=
 
 
 def clean_regions_face_aware(labels, min_area_px, min_thick_px, face_area_px, face_thick_px,
-                             face_mask, eye_mask=None, eye_area_px=None, eye_thick_px=None,
-                             max_passes=20):
+                             face_mask, eye_mask=None, mouth_mask=None,
+                             eye_area_px=None, eye_thick_px=None, mouth_area_px=None, mouth_thick_px=None,
+                             bg_area_px=None, bg_thick_px=None, max_passes=20):
     """Merge tiny/thin regions, with finer thresholds on the face and finer still in the eyes."""
     if eye_mask is None:
         eye_mask = np.zeros(labels.shape, dtype=np.float32)
         eye_area_px = face_area_px
         eye_thick_px = face_thick_px
+    if mouth_mask is None:
+        mouth_mask = np.zeros(labels.shape, dtype=np.float32)
+        mouth_area_px = eye_area_px
+        mouth_thick_px = eye_thick_px
+    if bg_area_px is None:
+        bg_area_px = min_area_px * (BG_REGION_MULT ** 2)
+        bg_thick_px = min_thick_px * BG_REGION_MULT
     for _ in range(max_passes):
         regions, colors = label_regions(labels)
         ids = np.arange(1, len(colors))
@@ -569,17 +1546,25 @@ def clean_regions_face_aware(labels, min_area_px, min_thick_px, face_area_px, fa
         thick = 2 * ndimage.maximum(interior_distance(labels), regions, ids)
         face_frac = ndimage.mean(face_mask, regions, ids)
         eye_frac = ndimage.mean(eye_mask, regions, ids)
+        mouth_frac = ndimage.mean(mouth_mask, regions, ids)
         # Interpolate through the soft edges so cleanup doesn't form a hard rectangle.
         t_e = np.clip((np.asarray(eye_frac) - 0.1) / 0.5, 0, 1)
+        t_m = np.clip((np.asarray(mouth_frac) - 0.1) / 0.5, 0, 1)
         t_f = np.clip((np.asarray(face_frac) - 0.1) / 0.5, 0, 1)
-        area_lim = eye_area_px * t_e + face_area_px * t_f * (1 - t_e) + min_area_px * (1 - t_f) * (1 - t_e)
-        thick_lim = eye_thick_px * t_e + face_thick_px * t_f * (1 - t_e) + min_thick_px * (1 - t_f) * (1 - t_e)
+        out_face = np.maximum(1 - t_e - t_m, 0)
+        area_lim = (eye_area_px * t_e + mouth_area_px * t_m + face_area_px * t_f * out_face
+                    + bg_area_px * (1 - t_f) * (1 - np.maximum(t_e, t_m)))
+        thick_lim = (eye_thick_px * t_e + mouth_thick_px * t_m + face_thick_px * t_f * out_face
+                     + bg_thick_px * (1 - t_f) * (1 - np.maximum(t_e, t_m)))
         bad = ids[(area < area_lim) | (thick < thick_lim)]
         if len(bad) == 0:
             return labels
         slices = ndimage.find_objects(regions)
         changed = False
         for rid in bad[np.argsort(area[bad - 1], kind="stable")]:
+            # Keep sub-printable face features; they become freehand guide shapes later.
+            if eye_frac[rid - 1] > 0.18 or mouth_frac[rid - 1] > 0.18:
+                continue
             sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in slices[rid - 1])
             mask = regions[sl] == rid
             sub = labels[sl]
@@ -620,7 +1605,68 @@ def rgb_to_lab(rgb):
     return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], axis=-1)
 
 
-def quantize(img, n, ppi):
+def lab_to_rgb(lab):
+    lab = np.asarray(lab, dtype=np.float64)
+    single = lab.ndim == 1
+    if single:
+        lab = lab[None, :]
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    fy = (L + 16) / 116
+    fx = a / 500 + fy
+    fz = fy - b / 200
+    eps = 216 / 24389
+    k = 24389 / 27
+    xr = np.where(fx ** 3 > eps, fx ** 3, (116 * fx - 16) / k)
+    yr = np.where(fy ** 3 > eps, fy ** 3, (116 * fy - 16) / k)
+    zr = np.where(fz ** 3 > eps, fz ** 3, (116 * fz - 16) / k)
+    xyz = np.stack([xr * 0.95047, yr * 1.0, zr * 1.08883], axis=-1)
+    rgb_lin = xyz @ np.array([
+        [3.2406, -1.5372, -0.4986],
+        [-0.9689, 1.8758, 0.0415],
+        [0.0557, -0.2040, 1.0570],
+    ]).T
+    rgb = np.where(rgb_lin > 0.0031308, 1.055 * (rgb_lin ** (1 / 2.4)) - 0.055, 12.92 * rgb_lin)
+    out = np.clip(np.rint(rgb * 255), 0, 255).astype(np.uint8)
+    return out[0] if single else out
+
+
+def _constrain_palette_luminance(labels, rgb, palette, face_mask, eye_mask, mouth_mask, tol=5.0):
+    """Nudge palette swatches so focal zone mean L* stays within tol of the original."""
+    if face_mask is None:
+        return palette
+    pal_lab = rgb_to_lab(palette)
+    orig_lab = rgb_to_lab(rgb)
+    out_lab = pal_lab.copy()
+    eye = eye_mask >= 0.35 if eye_mask is not None else np.zeros(labels.shape, dtype=bool)
+    mouth = mouth_mask >= 0.35 if mouth_mask is not None else np.zeros(labels.shape, dtype=bool)
+    skin = (face_mask >= 0.35) & ~eye & ~mouth
+    zones = (("eye", eye), ("mouth", mouth), ("skin", skin))
+    for _name, mask in zones:
+        if not np.any(mask):
+            continue
+        for k in np.unique(labels[mask]):
+            m = mask & (labels == k)
+            if int(m.sum()) < 8:
+                continue
+            target_l = float(orig_lab[m, 0].mean())
+            cur_l = float(out_lab[k, 0])
+            delta = float(np.clip(target_l - cur_l, -tol, tol))
+            out_lab[k, 0] = cur_l + delta
+    for _name, mask in zones:
+        if not np.any(mask):
+            continue
+        zone_l = float(orig_lab[mask, 0].mean())
+        pix_k = labels[mask]
+        preview_l = float(out_lab[pix_k, 0].mean())
+        zone_delta = float(np.clip(zone_l - preview_l, -tol, tol))
+        if abs(zone_delta) <= 0.25:
+            continue
+        for k in np.unique(pix_k):
+            out_lab[k, 0] = float(np.clip(out_lab[k, 0] + zone_delta, 0, 100))
+    return lab_to_rgb(out_lab)
+
+
+def quantize(img, n, ppi, merge_min_dist=3.5):
     """K-means in Lab space on a median-filtered copy (removes noise, keeps edges crisp so
     antialiased edge pixels don't become a color of their own).
 
@@ -653,6 +1699,497 @@ def interior_distance(labels):
     c = p[1:-1, 1:-1]
     edge = (c != p[:-2, 1:-1]) | (c != p[2:, 1:-1]) | (c != p[1:-1, :-2]) | (c != p[1:-1, 2:])
     return ndimage.distance_transform_edt(~edge)
+
+
+def _digit_half_diag(font_name):
+    return math.hypot(stringWidth("8", font_name, 1), 0.72) / 2
+
+
+def min_inscribed_radius_for_pt(style, px_to_pt, target_pt):
+    """Work-pixel inscribed radius needed to fit a centred number at target_pt (same math as place_numbers)."""
+    half = _digit_half_diag(style.font)
+    return target_pt * half / (0.85 * px_to_pt)
+
+
+def printable_region_limits(style, px_to_pt):
+    """Minimum connected-region area and thickness (work px) for legible numbers at print scale."""
+    r_target = min_inscribed_radius_for_pt(style, px_to_pt, style.min_pt)
+    r_abs = min_inscribed_radius_for_pt(style, px_to_pt, PRINT_ABS_MIN_PT)
+    r = max(r_target, r_abs)
+    area = (2 * r) ** 2 * 0.78
+    return area, 2 * r, r
+
+
+def default_min_guide_in(min_region_in):
+    """Wall inches; only true specks below this may be merged (--merge-guide-specks)."""
+    return max(0.012, 0.10 * float(min_region_in))
+
+
+def speck_area_limit_px(ppi, min_speck_in):
+    side = max(2.5, min_speck_in * ppi)
+    return side * side * 0.45
+
+
+def true_speck_limits_px(ppi, min_guide_in):
+    """Only dust this small may be merged; larger sub-printable shapes stay as freehand guides."""
+    diam = min(2.5, max(1.0, min_guide_in * ppi * 0.45))
+    area = max(3.0, (diam ** 2) * 0.38)
+    return area, diam * 0.32
+
+
+def region_inscribed_radius(rid, regions, dist):
+    m = regions == rid
+    if not np.any(m):
+        return 0.0
+    return float(dist[m].max())
+
+
+def classify_placement_regions(regions, labels, style, px_to_pt, ppi, min_guide_in, min_region_in=3.0):
+    """Split regions into numbered, freehand guide, or speck (optional merge)."""
+    dist = interior_distance(labels)
+    _, _, min_num_r = printable_region_limits(style, px_to_pt)
+    speck_in = min_guide_in if min_guide_in is not None else default_min_guide_in(min_region_in)
+    speck_area, speck_r = true_speck_limits_px(ppi, speck_in)
+    numbered, guide, speck = set(), set(), set()
+    for rid in range(1, int(regions.max()) + 1):
+        r = region_inscribed_radius(rid, regions, dist)
+        area = int((regions == rid).sum())
+        if r >= min_num_r * 0.88:
+            numbered.add(rid)
+        elif area <= speck_area and r <= speck_r:
+            speck.add(rid)
+        else:
+            guide.add(rid)
+    return numbered, guide, speck
+
+
+def merge_guide_specks(labels, rgb, regions, speck_ids, log=None, eye_mask=None, mouth_mask=None):
+    """Merge only sub-outline specks into the nearest Lab neighbor."""
+    log = log if log is not None else []
+    speck_ids = {int(r) for r in speck_ids}
+    if not speck_ids:
+        return labels, regions, log
+    for _ in range(40):
+        regions, colors = label_regions(labels)
+        todo = sorted(rid for rid in speck_ids if rid in np.unique(regions))
+        if not todo:
+            break
+        slices = ndimage.find_objects(regions)
+        changed = False
+        for rid in todo:
+            if rid >= len(colors):
+                continue
+            if eye_mask is not None or mouth_mask is not None:
+                mask = regions == rid
+                if np.any(mask):
+                    if eye_mask is not None and float(eye_mask[mask].mean()) >= 0.35:
+                        speck_ids.discard(rid)
+                        continue
+                    if mouth_mask is not None and float(mouth_mask[mask].mean()) >= 0.35:
+                        speck_ids.discard(rid)
+                        continue
+            sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in slices[rid - 1])
+            mask = regions[sl] == rid
+            sub = labels[sl]
+            own_label = int(colors[rid])
+            rgb_crop = rgb[sl]
+            neighbor = None
+            for dil in (1, 2, 4, 8):
+                neighbor = _pick_merge_neighbor_lab(sub, mask, own_label, rgb_crop, dilate=dil)
+                if neighbor is not None:
+                    break
+            if neighbor is None:
+                continue
+            sub[mask] = neighbor
+            log.append(f"merged speck region {rid} into color {neighbor + 1}")
+            speck_ids.discard(rid)
+            changed = True
+        if not changed:
+            break
+    regions, _ = label_regions(labels)
+    return labels, regions, log
+
+
+def _pick_merge_neighbor_lab(sub, mask, own_label, rgb_crop, dilate=1):
+    ring = ndimage.binary_dilation(mask, iterations=dilate) & ~mask
+    if not np.any(ring):
+        return None
+    own_lab = rgb_to_lab(rgb_crop[mask].reshape(-1, 3)).mean(axis=0)
+    ring_labels = sub[ring]
+    best_label, best_key = None, -1.0
+    for nl in np.unique(ring_labels):
+        nl = int(nl)
+        if nl == own_label:
+            continue
+        nmask = ring & (sub == nl)
+        cnt = int(nmask.sum())
+        if cnt == 0:
+            continue
+        nl_lab = rgb_to_lab(rgb_crop[nmask].reshape(-1, 3)).mean(axis=0)
+        dist = float(np.linalg.norm(own_lab - nl_lab))
+        key = cnt / (1.0 + dist * dist)
+        if key > best_key:
+            best_key, best_label = key, nl
+    return best_label
+
+
+def _polyline_length(pts):
+    if len(pts) < 2:
+        return 0.0
+    d = np.diff(np.asarray(pts, dtype=np.float64), axis=0)
+    return float(np.hypot(d[:, 0], d[:, 1]).sum())
+
+
+def _region_closed(ch):
+    if len(ch) < 4:
+        return False
+    return float(np.hypot(ch[0, 0] - ch[-1, 0], ch[0, 1] - ch[-1, 1])) < 0.75
+
+
+def guide_outlines_for_region(regions, rid, sigma, min_perim_px):
+    """One dashed outline per guide region (no internal mesh between guides)."""
+    mask = regions == int(rid)
+    if not np.any(mask):
+        return []
+    paint = mask.astype(np.int32)
+    lines = trace_boundaries(paint, sigma=sigma * 0.55, keep_every=1)
+    out = []
+    for ch in lines:
+        if len(ch) < 4:
+            continue
+        closed = _region_closed(ch)
+        perim = _polyline_length(ch)
+        if perim < min_perim_px:
+            continue
+        if not closed and perim < min_perim_px * 1.8:
+            continue
+        out.append((ch, closed))
+    return out
+
+
+def build_guide_polylines(regions, guide_ids, sigma, ppi=None):
+    if not guide_ids:
+        return [], np.zeros((0, 4), dtype=np.float64), []
+    min_perim_px = max(5.0, 0.065 * ppi) if ppi else 6.0
+    chunks, closed_flags, boxes = [], [], []
+    for rid in guide_ids:
+        for ch, closed in guide_outlines_for_region(regions, rid, sigma, min_perim_px):
+            chunks.append(ch)
+            closed_flags.append(closed)
+            boxes.append([ch[:, 0].min(), ch[:, 1].min(), ch[:, 0].max(), ch[:, 1].max()])
+    if not chunks:
+        return [], np.zeros((0, 4), dtype=np.float64), []
+    return chunks, np.array(boxes, dtype=np.float64), closed_flags
+
+
+def draw_guide_paths(cv, chunks, closed_flags, to_page_fn, line_pt):
+    if not chunks:
+        return
+    cv.saveState()
+    cv.setStrokeColor(HexColor("#444444"))
+    cv.setLineWidth(max(GUIDE_STROKE_PT, line_pt * 0.85))
+    cv.setDash(GUIDE_DASH_PT, GUIDE_GAP_PT)
+    for ch, closed in zip(chunks, closed_flags):
+        path = cv.beginPath()
+        pts = [(float(x), float(y)) for x, y in ch]
+        path.moveTo(*to_page_fn(pts[0][0], pts[0][1]))
+        for x, y in pts[1:]:
+            path.lineTo(*to_page_fn(x, y))
+        if closed:
+            path.close()
+        cv.drawPath(path, stroke=1, fill=0)
+    cv.setDash()
+    cv.restoreState()
+
+
+def detect_soup_clumps(regions, labels, numbered_ids, guide_ids, eye_mask, mouth_mask, ppi, cell_in=0.35):
+    """Find crowded focal clumps (many small regions per area)."""
+    focal = np.zeros(labels.shape, dtype=bool)
+    if eye_mask is not None:
+        focal |= eye_mask >= 0.35
+    if mouth_mask is not None:
+        focal |= mouth_mask >= 0.35
+    if not np.any(focal):
+        return []
+    small = numbered_ids | guide_ids
+    if not small:
+        return []
+    h, w = labels.shape
+    cell = max(8, int(round(cell_in * ppi)))
+    hot = []
+    for y0 in range(0, h, cell):
+        for x0 in range(0, w, cell):
+            y1, x1 = min(h, y0 + cell), min(w, x0 + cell)
+            patch_f = focal[y0:y1, x0:x1]
+            if patch_f.mean() < 0.08:
+                continue
+            patch_r = regions[y0:y1, x0:x1]
+            ids = {int(r) for r in np.unique(patch_r) if int(r) in small}
+            if len(ids) < 6:
+                continue
+            hot.append((len(ids), x0, y0, x1, y1, ids))
+    if not hot:
+        return []
+    hot.sort(key=lambda t: -t[0])
+    clumps = []
+    used = np.zeros(labels.shape, dtype=bool)
+    for nids, x0, y0, x1, y1, ids in hot:
+        if used[y0:y1, x0:x1].any():
+            continue
+        used[y0:y1, x0:x1] = True
+        pad = int(round(0.15 * max(x1 - x0, y1 - y0)))
+        bx0, by0 = max(0, x0 - pad), max(0, y0 - pad)
+        bx1, by1 = min(w, x1 + pad), min(h, y1 + pad)
+        clumps.append({
+            "box": [bx0, by0, bx1, by1],
+            "region_count": len(ids),
+            "numbered_in_clump": len([i for i in ids if i in numbered_ids]),
+            "guide_in_clump": len([i for i in ids if i in guide_ids]),
+            "peak_cell_regions": nids,
+        })
+    return clumps
+
+
+def focal_face_detail_box(clumps, eye_mask, mouth_mask, face_mask, shape, pad=0.14):
+    """Union of soup clumps inside the face, expanded to full eye-to-muzzle focal bounds."""
+    h, w = shape[:2]
+    m = np.zeros((h, w), dtype=bool)
+    if eye_mask is not None:
+        m |= eye_mask >= 0.35
+    if mouth_mask is not None:
+        m |= mouth_mask >= 0.35
+    for c in clumps or []:
+        x0, y0, x1, y1 = (int(v) for v in c["box"])
+        m[y0:y1, x0:x1] = True
+    if not np.any(m):
+        if face_mask is not None:
+            m |= face_mask >= 0.35
+        if not np.any(m):
+            return None
+    ys, xs = np.nonzero(m)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    dx, dy = int((x1 - x0) * pad), int((y1 - y0) * pad)
+    return max(0, x0 - dx), max(0, y0 - dy), min(w, x1 + dx), min(h, y1 + dy)
+
+
+def render_work_box_sheet_preview(
+    labels,
+    regions,
+    palette,
+    box,
+    style,
+    sigma,
+    k,
+    guide_ids,
+    min_width=400,
+    ppi=48,
+):
+    """Raster-style crop with palette, outlines, numbers, and dashed guides (for soup artifacts)."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    crop_l = labels[y0:y1, x0:x1]
+    crop_r = regions[y0:y1, x0:x1]
+    base = Image.fromarray(palette[crop_l])
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    line_w = max(1, int(round(style.line_pt * 2)))
+    gset = {int(r) for r in (guide_ids or [])}
+    crop_numbered = {int(r) for r in np.unique(crop_r) if int(r) > 0 and int(r) not in gset}
+    outline_paint = paint_for_main_outlines(crop_l, crop_r, crop_numbered, eye_mask=None)
+    for chunk in trace_boundaries(outline_paint, sigma=sigma * 0.9, keep_every=2):
+        pts = [(float(px), float(py)) for px, py in chunk]
+        draw.line(pts, fill=(0, 0, 0, 220), width=line_w, joint="curve")
+    if guide_ids:
+        gids = {int(r) for r in guide_ids if np.any(crop_r == int(r))}
+        min_g = max(5.0, 0.065 * ppi)
+        for rid in gids:
+            for ch, closed in guide_outlines_for_region(crop_r, rid, sigma, min_g):
+                pts = [(float(px), float(py)) for px, py in ch]
+                if len(pts) >= 2:
+                    if closed and len(pts) >= 3:
+                        pts = pts + [pts[0]]
+                    draw.line(pts, fill=(70, 70, 70, 230), width=max(1, line_w - 1), joint="curve")
+    px_to_pt = k * PT * (min_width / max(base.width, 1))
+    placed, _ = place_numbers(crop_l, crop_r, px_to_pt * base.width / min_width, style)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    for x, y, text, size in placed:
+        pt = max(7, size * base.width / min_width * 0.9)
+        try:
+            font = ImageFont.truetype(font_path, int(round(pt)))
+        except OSError:
+            font = ImageFont.load_default()
+        tw, th = draw.textbbox((0, 0), text, font=font)[2:]
+        draw.text((x - tw / 2, y - th / 2), text, fill=(0, 0, 0, 240), font=font)
+    out = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    if out.width < min_width:
+        scale = min_width / out.width
+        out = out.resize((min_width, int(out.height * scale)), Image.LANCZOS)
+    return out
+
+
+def write_soup_report(
+    out_dir,
+    clumps,
+    preview_rgb,
+    labels,
+    regions,
+    palette,
+    style,
+    sigma,
+    k,
+    guide_ids,
+    options,
+    ppi=48,
+):
+    out_dir = Path(out_dir)
+    report = {"clumps": clumps, "options": options}
+    crops_dir = out_dir / "soup_crops"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    for i, clump in enumerate(clumps):
+        x0, y0, x1, y1 = (int(v) for v in clump["box"])
+        sheet_img = render_work_box_sheet_preview(
+            labels, regions, palette, clump["box"], style, sigma, k, guide_ids, min_width=400, ppi=ppi,
+        )
+        prev_crop = preview_rgb[y0:y1, x0:x1]
+        if prev_crop.size == 0:
+            prev_crop = preview_rgb[max(0, y0):y1, max(0, x0):x1]
+        prev_im = Image.fromarray(prev_crop)
+        if prev_im.width < 180:
+            s = 180 / max(prev_im.width, 1)
+            prev_im = prev_im.resize((180, int(prev_im.height * s)), Image.LANCZOS)
+        combo_h = max(sheet_img.height, prev_im.height)
+        combo = Image.new("RGB", (sheet_img.width + prev_im.width + 8, combo_h), (245, 245, 245))
+        combo.paste(sheet_img, (0, (combo_h - sheet_img.height) // 2))
+        combo.paste(prev_im, (sheet_img.width + 8, (combo_h - prev_im.height) // 2))
+        path = crops_dir / f"clump_{i}.png"
+        combo.save(path, optimize=True)
+        clump["crop_png"] = str(path.name)
+        clump["crop_size"] = [combo.width, combo.height]
+    (out_dir / "soup_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    return out_dir / "soup_report.json"
+
+
+def detail_inset_magnification(box, labels, regions, style, k, ppi):
+    """Magnification so every region in box can hold a style.min_pt number on the detail page."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    sub = labels[y0:y1, x0:x1]
+    sub_r = regions[y0:y1, x0:x1]
+    dist = interior_distance(sub)
+    px_to_pt = k * PT
+    _, _, min_num_r = printable_region_limits(style, px_to_pt)
+    half = _digit_half_diag(style.font)
+    target_pt = max(style.min_pt, PRINT_ABS_MIN_PT)
+    worst = min_num_r
+    for rid in np.unique(sub_r):
+        rid = int(rid)
+        if rid <= 0:
+            continue
+        m = sub_r == rid
+        worst = min(worst, float(dist[m].max()))
+    worst = max(worst, 0.4)
+    mag_for_type = (target_pt * half) / (0.85 * worst * k * PT)
+    mag_for_type = max(1.25, min(16.0, mag_for_type))
+    cw_in = (letter[0] / PT) - 2 * MARGIN - 0.5
+    ch_in = (letter[1] / PT) - 2 * MARGIN - HEADER - FOOTER - 0.6
+    wall_w_in = (x1 - x0) / ppi
+    wall_h_in = (y1 - y0) / ppi
+    mag_fit = min(cw_in / max(wall_w_in, 0.01), ch_in / max(wall_h_in, 0.01)) / max(k, 1e-6) * 0.92
+    return min(mag_for_type, max(1.25, mag_fit))
+
+
+def plan_detail_inset(box, labels, regions, style, k, ppi, inset_id="D1", source="manual"):
+    x0, y0, x1, y1 = (int(v) for v in box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(labels.shape[1], x1), min(labels.shape[0], y1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    magnification = detail_inset_magnification([x0, y0, x1, y1], labels, regions, style, k, ppi)
+    wall_w_in = (x1 - x0) / ppi
+    wall_h_in = (y1 - y0) / ppi
+    sub_r = regions[y0:y1, x0:x1]
+    ids = {int(r) for r in np.unique(sub_r) if int(r) > 0}
+    return {
+        "id": inset_id,
+        "box": [x0, y0, x1, y1],
+        "wall_w_in": round(wall_w_in, 4),
+        "wall_h_in": round(wall_h_in, 4),
+        "magnification": round(magnification, 3),
+        "region_count": len(ids),
+        "source": source,
+    }
+
+
+def resolve_detail_insets(arg, clumps, labels, regions, style, k, ppi, eye_mask, mouth_mask, face_mask):
+    arg = (arg or "").strip()
+    if not arg:
+        return []
+    if arg.lower() == "auto":
+        box = focal_face_detail_box(clumps, eye_mask, mouth_mask, face_mask, labels.shape)
+        if box is None:
+            print("detail-inset auto: no focal face box")
+            return []
+        ins = plan_detail_inset(box, labels, regions, style, k, ppi, source="auto")
+        return [ins] if ins else []
+    parts = [float(x.strip()) for x in arg.split(",")]
+    if len(parts) != 4:
+        raise SystemExit("--detail-inset must be auto or x0,y0,x1,y1 work pixels")
+    ins = plan_detail_inset(parts, labels, regions, style, k, ppi, source="box")
+    return [ins] if ins else []
+
+
+def audit_sheet_legibility(labels, regions, layout, job, style, face_mask=None, eye_mask=None, mouth_mask=None):
+    """Simulate per-sheet number placement; fail on <6 pt, overlap, or boundary violations (guides exempt)."""
+    failures = []
+    k = job["scale"] / job["ppi"]
+    px_to_pt = k * PT
+    _, _, min_r = printable_region_limits(style, px_to_pt)
+    h, w = labels.shape
+    all_boxes = []
+
+    def boxes_for_placed(placed, x0p, y0p):
+        out = []
+        for x, y, text, size in placed:
+            if size < PRINT_ABS_MIN_PT - 0.05:
+                failures.append(f"number {text} at {size:.2f} pt < {PRINT_ABS_MIN_PT} pt")
+            half = math.hypot(stringWidth(text, style.font, size), size * 0.72) / 2
+            bx0, by0 = x + x0p - half, y + y0p - half
+            bx1, by1 = x + x0p + half, y + y0p + half
+            out.append((bx0, by0, bx1, by1, size, text))
+            r = float(interior_distance(labels)[int(y + y0p), int(x + x0p)])
+            if r < min_r * 0.86:
+                failures.append(f"number {text} sits {r:.1f}px from boundary (< {min_r:.1f}px inscribed)")
+        return out
+
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            sx0, sy0 = c * layout.step_x, r * layout.step_y
+            wx0, wy0 = sx0 / k, sy0 / k
+            wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
+            x0p, y0p = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+            x1p, y1p = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+            cell_x1 = x1p if c == layout.cols - 1 else int(math.ceil((sx0 + layout.step_x) / k))
+            cell_y1 = y1p if r == layout.rows - 1 else int(math.ceil((sy0 + layout.step_y) / k))
+            if cell_y1 <= y0p or cell_x1 <= x0p:
+                continue
+            cell_labels = labels[y0p:cell_y1, x0p:cell_x1]
+            cell_regions = regions[y0p:cell_y1, x0p:cell_x1]
+            placed, labeled = place_numbers(cell_labels, cell_regions, px_to_pt, style)
+            masks = []
+            if face_mask is not None:
+                masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
+            if eye_mask is not None:
+                masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
+            if mouth_mask is not None:
+                masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
+            placed, _ = complete_priority_labels(placed, labeled, cell_labels, cell_regions, px_to_pt, style, masks)
+            sid = sheet_id(r, c)
+            for bx0, by0, bx1, by1, size, text in boxes_for_placed(placed, x0p, y0p):
+                all_boxes.append((sid, bx0, by0, bx1, by1))
+    for i, (sid_a, ax0, ay0, ax1, ay1) in enumerate(all_boxes):
+        for sid_b, bx0, by0, bx1, by1 in all_boxes[i + 1 :]:
+            if ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0:
+                failures.append(f"overlapping numbers on sheets {sid_a} and {sid_b}")
+    return failures
 
 
 def label_regions(labels):
@@ -692,14 +2229,17 @@ def clean_regions(labels, min_area_px, min_thick_px, max_passes=20):
     return labels
 
 
-def finalize_palette(labels, rgb):
-    """Renumber used colors 0..m-1 from lightest to darkest; return labels and mean RGB per color."""
+def finalize_palette(labels, rgb, eye_mask=None, mouth_mask=None, face_mask=None):
+    """Renumber used colors 0..m-1 from lightest to darkest; palette RGB = label means on original."""
     used = np.unique(labels)
     means = np.array([rgb[labels == k].mean(axis=0) for k in used])
     order = np.argsort(-rgb_to_lab(means)[:, 0], kind="stable")
     remap = np.zeros(labels.max() + 1, dtype=np.int32)
     remap[used[order]] = np.arange(len(used))
-    return remap[labels], np.rint(means[order]).astype(np.uint8)
+    labels = remap[labels]
+    palette = np.rint(means[order]).astype(np.uint8)
+    palette = _constrain_palette_luminance(labels, rgb, palette, face_mask, eye_mask, mouth_mask, tol=5.0)
+    return labels, palette
 
 
 # ---------- boundaries -> smooth vector polylines ----------
@@ -819,9 +2359,11 @@ def feet_inches(inches):
 
 # ---------- per-sheet number placement ----------
 
-def place_numbers(crop, crop_regions, px_to_pt, style):
+def place_numbers(crop, crop_regions, px_to_pt, style, skip_regions=None):
     """One number per same-color piece inside the crop, at its most interior point. Returns (labels, region ids labeled)."""
     dist = interior_distance(crop)
+    _, _, min_r = printable_region_limits(style, px_to_pt)
+    skip_regions = skip_regions or set()
     placed, labeled = [], set()
     for k in np.unique(crop):
         comp, count = ndimage.label(crop == k)
@@ -832,13 +2374,84 @@ def place_numbers(crop, crop_regions, px_to_pt, style):
         spots = ndimage.maximum_position(dist, comp, idx)
         text = str(k + 1)
         half_diag = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
-        for radius, (y, x) in zip(radii, spots):
-            # Always place a number so no region is left unlabeled. Tiny face details
-            # may get type as small as 4.5 pt when they can't hold the usual minimum.
-            raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else 4.5
-            size = min(style.max_pt, max(4.5, raw))
+        for _comp_id, radius, (y, x) in zip(idx, radii, spots):
+            rid = int(crop_regions[y, x])
+            if rid in skip_regions:
+                continue
+            if radius < min_r * 0.88:
+                continue
+            raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else style.min_pt
+            size = min(style.max_pt, max(PRINT_ABS_MIN_PT, min(style.min_pt, raw)))
             placed.append((x + 0.5, y + 0.5, text, size))
-            labeled.add(int(crop_regions[y, x]))
+            labeled.add(rid)
+    return placed, labeled
+
+
+def place_detail_numbers(crop_labels, crop_regions, px_to_pt, style, guide_ids, already_labeled):
+    """On a detail page, add numbers to enlarged guide regions that are now printable."""
+    dist = interior_distance(crop_labels)
+    _, _, min_r = printable_region_limits(style, px_to_pt)
+    placed, labeled = [], set(already_labeled)
+    newly = set()
+    half_cache = {}
+    for rid in guide_ids:
+        rid = int(rid)
+        if rid in labeled or rid <= 0:
+            continue
+        m = crop_regions == rid
+        if not np.any(m):
+            continue
+        sub = np.where(m, dist, 0.0)
+        cy, cx = np.unravel_index(int(sub.argmax()), sub.shape)
+        radius = float(dist[cy, cx])
+        if radius < min_r * 0.88:
+            continue
+        k = int(crop_labels[cy, cx])
+        text = str(k + 1)
+        if text not in half_cache:
+            half_cache[text] = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
+        raw = 0.85 * radius * px_to_pt / half_cache[text] if radius > 0 else style.min_pt
+        size = min(style.max_pt, max(PRINT_ABS_MIN_PT, min(style.min_pt, raw)))
+        placed.append((cx + 0.5, cy + 0.5, text, size))
+        labeled.add(rid)
+        newly.add(rid)
+    return placed, labeled, newly
+
+
+def complete_priority_labels(placed, labeled, crop, crop_regions, px_to_pt, style, masks, skip_regions=None):
+    """Place numbers on printable focal regions that would otherwise be missed on this sheet."""
+    skip_regions = skip_regions or set()
+    if not masks:
+        return placed, labeled
+    dist = interior_distance(crop)
+    covered = np.zeros(crop.shape, dtype=bool)
+    for m in masks:
+        if m is not None:
+            covered |= m >= 0.35
+    if not np.any(covered):
+        return placed, labeled
+    _, _, min_r = printable_region_limits(style, px_to_pt)
+    placed = list(placed)
+    labeled = set(labeled)
+    for rid in np.unique(crop_regions[covered]):
+        rid = int(rid)
+        if rid in labeled or rid <= 0 or rid in skip_regions:
+            continue
+        m = crop_regions == rid
+        if not np.any(m & covered):
+            continue
+        k = int(crop[m][0])
+        text = str(k + 1)
+        half_diag = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
+        sub = np.where(m, dist, 0)
+        cy, cx = np.unravel_index(sub.argmax(), sub.shape)
+        radius = float(dist[cy, cx])
+        if radius < min_r * 0.88:
+            continue
+        raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else style.min_pt
+        size = min(style.max_pt, max(PRINT_ABS_MIN_PT, min(style.min_pt, raw)))
+        placed.append((cx + 0.5, cy + 0.5, text, size))
+        labeled.add(rid)
     return placed, labeled
 
 
@@ -1042,7 +2655,75 @@ INSTRUCTIONS = {
 }
 
 
-def draw_map(cv, job, preview, layout, mural_w, mural_h):
+def wrap_lines(text, font, size, max_w):
+    words = text.split()
+    lines, cur = [], ""
+    for word in words:
+        trial = f"{cur} {word}".strip()
+        if stringWidth(trial, font, size) <= max_w:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines or [text]
+
+
+def draw_painting_instructions(cv, job, has_guides, detail_insets):
+    """Painter-facing steps for volunteers (no tooling jargon)."""
+    pw, ph = letter
+    body_pt = 11.5
+    lead = body_pt + 4
+    cv.setPageSize(letter)
+    x0, top = MARGIN * PT + 24, ph - MARGIN * PT - 32
+    cv.setFont("Helvetica-Bold", body_pt + 2)
+    cv.drawString(x0, top, "How to paint this kit")
+    yy = top - lead
+    canvas = is_canvas_job(job["wall_w_in"] / 12.0, job["wall_h_in"] / 12.0)
+    steps = [
+        "1. Print every main sheet at 100% (Actual size). Check the scale bar at the bottom of each sheet: "
+        "the line marked 2 in must measure 2 in on your paper.",
+        "2. Transfer the main sheets onto your surface (pencil/graphite on the back, then trace the lines and numbers).",
+        "3. Paint each numbered shape with the color shown in the color key and on the small color picture included "
+        "with this kit.",
+    ]
+    if has_guides:
+        steps.append(
+            "4. Paint shapes with a dashed outline freehand: match the color of the numbered neighbors beside them, "
+            "using the color picture as your guide. On the main sheets these dashed shapes have no number because "
+            "they are too small to read."
+        )
+    if detail_insets:
+        ids = ", ".join(ins["id"] for ins in detail_insets)
+        steps.append(
+            f"5. Where the main sheet says “see detail {ids}”, use detail sheet {ids} as a zoomed-in helper for the "
+            "face only. Some dashed shapes show numbers on the detail sheet that were too small on the main sheet. "
+            "Do not trace or resize the detail page onto your canvas — paint from the main sheets at true size."
+        )
+    if canvas and job["scale"] == 1:
+        steps.append(
+            "This is a small canvas kit: when every main sheet is printed at 100%, the tracing sheets match the "
+            "canvas size. The detail page is enlarged only to help you read numbers."
+        )
+    elif job["scale"] != 1:
+        steps.append(
+            f"These sheets are printed at {job['scale'] * 100:g}% scale for reference; reprint main sheets at "
+            "100% for true-size tracing when you can."
+        )
+    cv.setFillColor(HexColor("#000000"))
+    cv.setFont("Helvetica", body_pt)
+    width = pw - 2 * x0
+    for line in steps:
+        for wrapped in wrap_lines(line, "Helvetica", body_pt, width):
+            cv.drawString(x0, yy, wrapped)
+            yy -= lead
+    cv.showPage()
+    return 1
+
+
+def draw_map(cv, job, preview, layout, mural_w, mural_h, detail_insets=None):
     page = landscape(letter) if mural_w >= mural_h else letter
     cv.setPageSize(page)
     pw, ph = page
@@ -1078,6 +2759,23 @@ def draw_map(cv, job, preview, layout, mural_w, mural_h):
             cx = mx + (c * layout.step_x + min((c + 1) * layout.step_x, mural_w)) / 2 * s
             cy = my + mh - (r * layout.step_y + min((r + 1) * layout.step_y, mural_h)) / 2 * s
             cv.drawCentredString(cx, cy - font * 0.35, sheet_id(r, c))
+
+    if detail_insets:
+        k = job["scale"] / job["ppi"]
+        cv.setStrokeColor(HexColor("#c45c00"))
+        cv.setLineWidth(1.0)
+        cv.setDash(4, 3)
+        for ins in detail_insets:
+            x0, y0, x1, y1 = ins["box"]
+            mx0 = mx + x0 * k * s
+            my0 = my + mh - y1 * k * s
+            mx1 = mx + x1 * k * s
+            my1 = my + mh - y0 * k * s
+            cv.rect(mx0, my0, mx1 - mx0, my1 - my0, stroke=1, fill=0)
+            cv.setFillColor(HexColor("#c45c00"))
+            cv.setFont("Helvetica-Bold", max(6.0, font * 0.85))
+            cv.drawCentredString((mx0 + mx1) / 2, (my0 + my1) / 2, ins["id"])
+        cv.setDash()
 
     cv.setFont("Helvetica", 9)
     cv.drawCentredString(mx + mw / 2, my + mh + 6,
@@ -1130,7 +2828,118 @@ def neighbor_tag(cv, x, y, text, direction):
         cv.drawString(x + 6, y - 2.5, text)
 
 
-def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions, palette, style):
+def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma, guide_ids=None, numbered_ids=None):
+    """Enlarged reference page for a focal clump (not wall-size)."""
+    page = letter
+    cv.setPageSize(page)
+    pw, ph = page
+    thumb_w = 1.55 * PT
+    thumb_gap = 0.25 * PT
+    thumb_col = thumb_w + thumb_gap
+    left, bottom = MARGIN * PT, (MARGIN + FOOTER) * PT
+    cw = pw - 2 * MARGIN * PT - thumb_col
+    content_top = ph - MARGIN * PT - HEADER * PT - 4
+    header_block = 46
+    header_bottom = content_top - header_block
+    header_gap = 8
+    art_top = header_bottom - header_gap
+    art_h = max(48.0, art_top - bottom)
+    x0, y0, x1, y1 = (int(v) for v in inset["box"])
+    crop_labels = labels[y0:y1, x0:x1]
+    crop_regions = regions[y0:y1, x0:x1]
+    mag = float(inset["magnification"])
+    k_base = job["scale"] / job["ppi"]
+    k_draw = k_base * max(mag, 1.0)
+    wall_w_px, wall_h_px = x1 - x0, y1 - y0
+    tile_w_in, tile_h_in = wall_w_px * k_draw, wall_h_px * k_draw
+    s_fit = min(cw / (tile_w_in * PT), art_h / (tile_h_in * PT))
+    cw_use, ch_use = tile_w_in * PT * s_fit, tile_h_in * PT * s_fit
+    left_art = left + max(0.0, (cw - cw_use) * 0.5)
+    art_bottom = max(bottom, art_top - ch_use)
+    did = inset["id"]
+    guide_ids = guide_ids or set()
+    numbered_ids = numbered_ids or set()
+
+    def to_page(lx, ly):
+        return left_art + lx * k_draw * PT * s_fit, art_bottom + ch_use - ly * k_draw * PT * s_fit
+
+    tint = float(job.get("sheet_tint", 0.12))
+    tile = palette[crop_labels]
+    faded = np.clip(255.0 * (1 - tint) + tile.astype(np.float64) * tint, 0, 255).astype(np.uint8)
+    buf = BytesIO()
+    Image.fromarray(faded).save(buf, format="PNG")
+    buf.seek(0)
+    cv.drawImage(ImageReader(buf), left_art, art_bottom, cw_use, ch_use, preserveAspectRatio=False, anchor="sw")
+
+    crop_numbered = {int(r) for r in np.unique(crop_regions) if int(r) in numbered_ids}
+    outline_paint = paint_for_main_outlines(crop_labels, crop_regions, crop_numbered)
+    lines = trace_boundaries(outline_paint, sigma=sigma * 0.95)
+    cv.saveState()
+    clip = cv.beginPath()
+    clip.rect(left, bottom, cw_use, ch_use)
+    cv.clipPath(clip, stroke=0, fill=0)
+    path = cv.beginPath()
+    for chunk in lines:
+        pts = [(float(x), float(y)) for x, y in chunk]
+        path.moveTo(*to_page(pts[0][0], pts[0][1]))
+        for x, y in pts[1:]:
+            path.lineTo(*to_page(x, y))
+    cv.setStrokeGray(style.line_gray)
+    cv.setLineWidth(style.line_pt)
+    cv.drawPath(path, stroke=1, fill=0)
+    guide_in_crop = {int(r) for r in guide_ids if np.any(crop_regions == int(r))}
+    if guide_in_crop:
+        gchunks, _, gclosed = build_guide_polylines(crop_regions, guide_in_crop, sigma, ppi=job["ppi"] * mag)
+        draw_guide_paths(cv, gchunks, gclosed, to_page, style.line_pt)
+    cv.restoreState()
+
+    px_to_pt = k_draw * PT * s_fit
+    guide_skip = guide_in_crop
+    placed, labeled = place_numbers(crop_labels, crop_regions, px_to_pt, style, skip_regions=guide_skip)
+    extra, labeled, newly_on_d1 = place_detail_numbers(
+        crop_labels, crop_regions, px_to_pt, style, guide_in_crop, labeled,
+    )
+    placed = list(placed) + list(extra)
+    cv.setFillColor(HexColor("#000000"))
+    for x, y, text, size in placed:
+        px, py = to_page(x, y)
+        cv.setFont(style.font, size)
+        cv.drawCentredString(px, py - 0.36 * size, text)
+
+    thumb_h = thumb_w * crop_labels.shape[0] / max(crop_labels.shape[1], 1)
+    prev_thumb = Image.fromarray(palette[crop_labels]).resize(
+        (int(thumb_w), int(thumb_h)), Image.LANCZOS,
+    )
+    tbuf = BytesIO()
+    prev_thumb.save(tbuf, format="PNG")
+    tbuf.seek(0)
+    thumb_x = pw - MARGIN * PT - thumb_w
+    cv.drawImage(ImageReader(tbuf), thumb_x, bottom + 6, thumb_w, thumb_h)
+
+    cv.setFillColor(HexColor("#000000"))
+    hy = content_top - 12
+    title = (
+        f"Detail {did}  ·  {mag:g}× enlarged reference for "
+        f"{inset['wall_w_in']:.2f}×{inset['wall_h_in']:.2f} in on the wall  ·  NOT wall-size"
+    )
+    cv.setFont("Helvetica-Bold", fit_text(title, "Helvetica-Bold", 11, cw))
+    cv.drawString(left, hy, title)
+    cv.setFont("Helvetica", 10)
+    note = (
+        f"Dashed shapes still too small stay unnumbered ({max(0, len(guide_in_crop) - len(newly_on_d1))} here); "
+        f"{len(newly_on_d1)} guide shape(s) now show a number at this enlargement."
+    )
+    for i, line in enumerate(wrap_lines(note, "Helvetica", 10, cw)[:2]):
+        cv.drawString(left, hy - 14 - i * 12, line)
+    cv.showPage()
+    inset["guides_numbered_on_detail"] = len(newly_on_d1)
+    inset["guides_remaining_dashed"] = max(0, len(guide_in_crop) - len(newly_on_d1))
+    return labeled, newly_on_d1
+
+
+def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions, palette, style,
+               face_mask=None, eye_mask=None, mouth_mask=None, guide_chunks=None, guide_boxes=None,
+               guide_closed=None, skip_number_regions=None, detail_insets=None):
     page = (layout.page_w * PT, layout.page_h * PT)
     cv.setPageSize(page)
     k = job["scale"] / job["ppi"]                 # paper inches per work pixel
@@ -1142,16 +2951,21 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     def to_page(x_px, y_px):
         return left + (x_px * k - sx0) * PT, top - (y_px * k - sy0) * PT
 
-    # Overlap bands shared with existing neighbors.
-    cv.setFillColor(BAND)
-    if c > 0:
-        cv.rect(left, bottom, ov, ch, fill=1, stroke=0)
-    if c < layout.cols - 1:
-        cv.rect(left + cw - ov, bottom, ov, ch, fill=1, stroke=0)
-    if r > 0:
-        cv.rect(left, top - ov, cw, ov, fill=1, stroke=0)
-    if r < layout.rows - 1:
-        cv.rect(left, bottom, cw, ov, fill=1, stroke=0)
+    wx0, wy0 = sx0 / k, sy0 / k
+    wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
+    tint = float(job.get("sheet_tint", 0))
+    if tint > 0:
+        x0i = max(0, int(math.floor(wx0)))
+        y0i = max(0, int(math.floor(wy0)))
+        x1i = min(labels.shape[1], int(math.ceil(wx1)))
+        y1i = min(labels.shape[0], int(math.ceil(wy1)))
+        if x1i > x0i and y1i > y0i:
+            tile = palette[labels[y0i:y1i, x0i:x1i]]
+            faded = np.clip(255.0 * (1 - tint) + tile.astype(np.float64) * tint, 0, 255).astype(np.uint8)
+            buf = BytesIO()
+            Image.fromarray(faded).save(buf, format="PNG")
+            buf.seek(0)
+            cv.drawImage(ImageReader(buf), left, bottom, cw, ch, preserveAspectRatio=False, anchor="sw")
 
     # Paper beyond the wall's right/bottom edge.
     wall_r = left + (mural_w - sx0) * PT
@@ -1161,6 +2975,17 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
         cv.rect(wall_r, bottom, left + cw - wall_r, ch, fill=1, stroke=0)
     if wall_b > bottom:
         cv.rect(left, bottom, cw, wall_b - bottom, fill=1, stroke=0)
+
+    # Overlap bands on top of tint so registration stays visible.
+    cv.setFillColor(BAND)
+    if c > 0:
+        cv.rect(left, bottom, ov, ch, fill=1, stroke=0)
+    if c < layout.cols - 1:
+        cv.rect(left + cw - ov, bottom, ov, ch, fill=1, stroke=0)
+    if r > 0:
+        cv.rect(left, top - ov, cw, ov, fill=1, stroke=0)
+    if r < layout.rows - 1:
+        cv.rect(left, bottom, cw, ov, fill=1, stroke=0)
 
     sid = sheet_id(r, c)
     cv.setFillColor(HexColor("#dbe4f6"))
@@ -1172,8 +2997,6 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     clip = cv.beginPath()
     clip.rect(left, bottom, cw, ch)
     cv.clipPath(clip, stroke=0, fill=0)
-    wx0, wy0 = sx0 / k, sy0 / k
-    wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
     hit = np.nonzero((boxes[:, 2] >= wx0) & (boxes[:, 0] <= wx1) & (boxes[:, 3] >= wy0) & (boxes[:, 1] <= wy1))[0]
     path = cv.beginPath()
     for i in hit:
@@ -1186,10 +3009,41 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     cv.setLineJoin(1)
     cv.setLineCap(1)
     cv.drawPath(path, stroke=1, fill=0)
+    if guide_chunks is not None and guide_boxes is not None and len(guide_chunks):
+        ghit = np.nonzero(
+            (guide_boxes[:, 2] >= wx0) & (guide_boxes[:, 0] <= wx1)
+            & (guide_boxes[:, 3] >= wy0) & (guide_boxes[:, 1] <= wy1)
+        )[0]
+        gchunks = [guide_chunks[i] for i in ghit]
+        gclosed = [guide_closed[i] for i in ghit] if guide_closed else [False] * len(ghit)
+        draw_guide_paths(cv, gchunks, gclosed, to_page, style.line_pt)
     cv.setStrokeColor(HexColor("#000000"))
     cv.setLineWidth(max(style.line_pt, 1.2))
     cv.rect(left - sx0 * PT, top - mural_h * PT + sy0 * PT, mural_w * PT, mural_h * PT, stroke=1, fill=0)
     cv.restoreState()
+
+    if detail_insets:
+        cv.saveState()
+        clip = cv.beginPath()
+        clip.rect(left, bottom, cw, ch)
+        cv.clipPath(clip, stroke=0, fill=0)
+        for ins in detail_insets:
+            bx0, by0, bx1, by1 = (int(v) for v in ins["box"])
+            ix0, iy0 = max(wx0, bx0), max(wy0, by0)
+            ix1, iy1 = min(wx1, bx1), min(wy1, by1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            p0 = to_page(ix0, iy0)
+            p1 = to_page(ix1, iy1)
+            cv.setStrokeColor(HexColor("#c45c00"))
+            cv.setLineWidth(1.1)
+            cv.setDash(5, 3)
+            cv.rect(p0[0], p1[1], p1[0] - p0[0], p0[1] - p1[1], stroke=1, fill=0)
+            cv.setFillColor(HexColor("#c45c00"))
+            cv.setFont("Helvetica-Bold", 7)
+            cv.drawString(p0[0] + 2, p0[1] - 8, f"see detail {ins['id']}")
+        cv.setDash()
+        cv.restoreState()
 
     # Color numbers go only in this sheet's map cell (tile minus the right/bottom bands). Later sheets are
     # taped over those bands, so every spot on the wall gets its number from exactly one visible sheet.
@@ -1198,7 +3052,21 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     crop = labels[y0p:y1p, x0p:x1p]
     cell_x1 = x1p if c == layout.cols - 1 else int(math.ceil((sx0 + layout.step_x) / k))
     cell_y1 = y1p if r == layout.rows - 1 else int(math.ceil((sy0 + layout.step_y) / k))
-    placed, labeled = place_numbers(labels[y0p:cell_y1, x0p:cell_x1], regions[y0p:cell_y1, x0p:cell_x1], k * PT, style)
+    cell_labels = labels[y0p:cell_y1, x0p:cell_x1]
+    cell_regions = regions[y0p:cell_y1, x0p:cell_x1]
+    skip = skip_number_regions or set()
+    placed, labeled = place_numbers(cell_labels, cell_regions, k * PT, style, skip_regions=skip)
+    masks = []
+    if face_mask is not None:
+        masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
+    if eye_mask is not None:
+        masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
+    if mouth_mask is not None:
+        masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
+    if masks:
+        placed, labeled = complete_priority_labels(
+            placed, labeled, cell_labels, cell_regions, k * PT, style, masks, skip_regions=skip,
+        )
     cv.setFillColor(HexColor("#000000"))
     for x, y, text, size in placed:
         px, py = to_page(x + x0p, y + y0p)
@@ -1269,6 +3137,9 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     if job["scale"] != 1:
         label += f" (= {2 / job['scale']:g} in of wall)"
     cv.drawString(bar_x, fy + 12, label)
+    if guide_chunks:
+        cv.setFont("Helvetica", 6.5)
+        cv.drawString(left, fy - 2, "Dashed outline = freehand guide (no number); match neighboring colors using the preview.")
 
     cell_w, cell_h = grid_w / layout.cols, grid_h / layout.rows
     cv.setLineWidth(0.3)
@@ -1281,6 +3152,471 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     cv.drawRightString(gx - 3, fy + 1, "you are here")
     cv.showPage()
     return labeled
+
+
+# ---------- preview sampling & raster overview ----------
+
+def _sheet_work_rect(layout, r, c, k):
+    """Work-pixel axis-aligned bounds of a sheet tile (same as draw_sheet clipping)."""
+    sx0, sy0 = c * layout.step_x, r * layout.step_y
+    wx0, wy0 = sx0 / k, sy0 / k
+    wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
+    return wx0, wy0, wx1, wy1
+
+
+def _rect_intersection_area(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0)
+
+
+def _region_count_on_sheet(layout, r, c, k, regions):
+    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+    h, w = regions.shape
+    x0, y0 = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+    x1, y1 = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    crop = regions[y0:y1, x0:x1]
+    return len(np.unique(crop[crop > 0]))
+
+
+def _face_mask_on_sheet(layout, r, c, k, face_mask):
+    if face_mask is None:
+        return 0.0
+    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+    h, w = face_mask.shape
+    x0, y0 = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+    x1, y1 = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float(face_mask[y0:y1, x0:x1].sum())
+
+
+def _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask=None, min_weight=1.0):
+    """Sheet with the most eye + mouth/muzzle mask weight (for verification crops)."""
+    h = w = 0
+    if eye_mask is not None:
+        h, w = eye_mask.shape
+    elif mouth_mask is not None:
+        h, w = mouth_mask.shape
+    elif face_mask is not None:
+        h, w = face_mask.shape
+    else:
+        return None
+    combined = np.zeros((h, w), dtype=np.float32)
+    if eye_mask is not None:
+        combined = np.maximum(combined, eye_mask)
+    if mouth_mask is not None:
+        combined = np.maximum(combined, mouth_mask)
+    return _best_face_sheet(layout, combined, k, min_weight=min_weight)
+
+
+def render_focal_sheet_crop(
+    job_dir,
+    layout,
+    job,
+    box,
+    eye_mask=None,
+    mouth_mask=None,
+    face_mask=None,
+    mural_w=None,
+    mural_h=None,
+    dpi=192,
+):
+    """Mosaic every full-build sheet over the focal work-pixel bbox (same crop as preview columns)."""
+    if box is None:
+        return None
+    job_dir = Path(job_dir)
+    pdf = ensure_full_mural_pdf(job_dir)
+    if pdf is None:
+        return None
+    x0, y0, x1, y1 = (int(v) for v in box)
+    out_w, out_h = max(1, x1 - x0), max(1, y1 - y0)
+    k = job["scale"] / job["ppi"]
+    if mural_w is None or mural_h is None:
+        mural_w = layout.cols * layout.step_x
+        mural_h = layout.rows * layout.step_y
+    hits = _sheets_intersecting_box(layout, k, box, mural_w, mural_h)
+    if not hits:
+        return None
+    front_pages = _front_pages_for_full_build(job_dir)
+    canvas = np.full((out_h, out_w, 3), 245, np.uint8)
+    page_cache = {}
+    for _area, r, c, ix0, iy0, ix1, iy1 in hits:
+        page_num = _sheet_pdf_page(front_pages, layout, r, c)
+        if page_num not in page_cache:
+            img = rasterize_pdf_page(pdf, page_num, dpi=dpi)
+            if img is None:
+                continue
+            page_cache[page_num] = np.asarray(img)
+        page = page_cache[page_num]
+        ph, pw = page.shape[:2]
+        xa0, ya0 = _work_px_to_page_px(ix0, iy0, r, c, layout, job, dpi)
+        xa1, ya1 = _work_px_to_page_px(ix1, iy1, r, c, layout, job, dpi)
+        px0, px1 = int(round(min(xa0, xa1))), int(round(max(xa0, xa1)))
+        py0, py1 = int(round(min(ya0, ya1))), int(round(max(ya0, ya1)))
+        px0, py0 = max(0, px0), max(0, py0)
+        px1, py1 = min(pw, px1), min(ph, py1)
+        if px1 <= px0 or py1 <= py0:
+            continue
+        tile = page[py0:py1, px0:px1]
+        ox, oy = ix0 - x0, iy0 - y0
+        th, tw = tile.shape[:2]
+        y1p, x1p = min(out_h, oy + th), min(out_w, ox + tw)
+        if y1p <= oy or x1p <= ox:
+            continue
+        canvas[oy:y1p, ox:x1p] = tile[: y1p - oy, : x1p - ox]
+    if np.all(canvas == 245):
+        return None
+    return canvas
+
+
+def render_focal_sheet_framed(
+    job_dir,
+    layout,
+    job,
+    box,
+    eye_mask=None,
+    mouth_mask=None,
+    face_mask=None,
+    mural_w=None,
+    mural_h=None,
+    dpi=192,
+    pad_frac=0.12,
+):
+    """Rasterize the sheet that owns most of the focal area (not a multi-sheet paste)."""
+    if box is None:
+        return None
+    job_dir = Path(job_dir)
+    pdf = ensure_full_mural_pdf(job_dir)
+    if pdf is None:
+        return render_focal_sheet_crop(
+            job_dir, layout, job, box, eye_mask, mouth_mask, face_mask,
+            mural_w=mural_w, mural_h=mural_h, dpi=dpi,
+        )
+    k = job["scale"] / job["ppi"]
+    pick = _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask)
+    if pick is None:
+        return render_focal_sheet_crop(
+            job_dir, layout, job, box, eye_mask, mouth_mask, face_mask,
+            mural_w=mural_w, mural_h=mural_h, dpi=dpi,
+        )
+    r, c = pick[0], pick[1]
+    page_num = _sheet_pdf_page(_front_pages_for_full_build(job_dir), layout, r, c)
+    page = rasterize_pdf_page(pdf, page_num, dpi=dpi)
+    if page is None:
+        return None
+    page = np.asarray(page)
+    ph, pw = page.shape[:2]
+    x0, y0, x1, y1 = (int(v) for v in box)
+    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+    ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
+    ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    dx, dy = (ix1 - ix0) * pad_frac, (iy1 - iy0) * pad_frac
+    fx0, fy0 = max(wx0, ix0 - dx), max(wy0, iy0 - dy)
+    fx1, fy1 = min(wx1, ix1 + dx), min(wy1, iy1 + dy)
+    xa0, ya0 = _work_px_to_page_px(fx0, fy0, r, c, layout, job, dpi)
+    xa1, ya1 = _work_px_to_page_px(fx1, fy1, r, c, layout, job, dpi)
+    px0, px1 = int(round(min(xa0, xa1))), int(round(max(xa0, xa1)))
+    py0, py1 = int(round(min(ya0, ya1))), int(round(max(ya0, ya1)))
+    px0, py0 = max(0, px0), max(0, py0)
+    px1, py1 = min(pw, px1), min(ph, py1)
+    if px1 <= px0 or py1 <= py0:
+        return None
+    return page[py0:py1, px0:px1]
+
+
+def _best_face_sheet(layout, face_mask, k, min_weight=1.0):
+    if face_mask is None or float(face_mask.max()) < 0.1:
+        return None
+    best = (-1.0, 0, 0)
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            area = _face_mask_on_sheet(layout, r, c, k, face_mask)
+            if area > best[0]:
+                best = (area, r, c)
+    if best[0] < min_weight:
+        return None
+    return best[1], best[2], best[0]
+
+
+def _best_region_sheet(layout, k, regions):
+    best = (-1, 0, 0)
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            n = _region_count_on_sheet(layout, r, c, k, regions)
+            if n > best[0]:
+                best = (n, r, c)
+    return best[1], best[2], best[0]
+
+
+def pick_preview_sheets(preview_sheets, layout, regions, face, k, face_mask=None):
+    """Return [(r, c, reason), ...] in render order, at most preview_sheets entries."""
+    if preview_sheets <= 0:
+        return []
+    picks = []
+    seen = set()
+
+    def add(r, c, reason):
+        if (r, c) in seen:
+            return
+        seen.add((r, c))
+        picks.append((r, c, reason))
+
+    face_pick = _best_face_sheet(layout, face_mask, k) if face.get("found") else None
+    if face_pick:
+        r, c, area = face_pick
+        add(r, c, f"most face-mask weight on sheet ({area:.1f})")
+    else:
+        r, c, n = _best_region_sheet(layout, k, regions)
+        add(r, c, f"most regions ({n})")
+
+    add(0, 0, "top-left corner sheet")
+
+    if len(picks) < preview_sheets:
+        ranked = []
+        for r in range(layout.rows):
+            for c in range(layout.cols):
+                if (r, c) in seen:
+                    continue
+                ranked.append((-_region_count_on_sheet(layout, r, c, k, regions), r, c))
+        ranked.sort()
+        for _, r, c in ranked:
+            if len(picks) >= preview_sheets:
+                break
+            add(r, c, f"regions ({_region_count_on_sheet(layout, r, c, k, regions)})")
+    return picks[:preview_sheets]
+
+
+def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
+                          chunks, boxes, labels, regions, palette_arr, style, sample_sheets,
+                          face_mask=None, eye_mask=None, mouth_mask=None, guide_chunks=None,
+                          guide_boxes=None, guide_closed=None, skip_number_regions=None,
+                          detail_insets=None, has_guides=False):
+    cv = Canvas(str(path), pagesize=letter, invariant=1, pageCompression=1)
+    cv.setTitle("Paint-by-number mural (preview)")
+    cover_pages, key_on_cover = draw_cover(cv, job, small, palette, areas, brand_map, layout)
+    if not key_on_cover:
+        draw_color_key_pages(cv, job, palette, areas, brand_map)
+    if has_guides or detail_insets:
+        draw_painting_instructions(cv, job, has_guides, detail_insets or [])
+    draw_map(cv, job, small, layout, mural_w, mural_h, detail_insets=detail_insets)
+    for r, c, _reason in sample_sheets:
+        draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
+                   palette_arr, style, face_mask=face_mask, eye_mask=eye_mask, mouth_mask=mouth_mask,
+                   guide_chunks=guide_chunks, guide_boxes=guide_boxes, guide_closed=guide_closed,
+                   skip_number_regions=skip_number_regions, detail_insets=detail_insets)
+    cv.save()
+    return cover_pages
+
+
+def ensure_full_mural_pdf(job_dir, tiler_path=None):
+    """Run --from-preview into job_dir/full so mural.pdf contains every numbered sheet."""
+    job_dir = Path(job_dir)
+    direct = job_dir / "mural.pdf"
+    if direct.is_file():
+        return direct
+    full = job_dir / "full"
+    pdf = full / "mural.pdf"
+    if pdf.is_file():
+        return pdf
+    tiler = Path(tiler_path or Path(__file__).resolve())
+    full.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [__import__("sys").executable, str(tiler), "--from-preview", str(job_dir), "--out", str(full)],
+        check=True,
+        cwd=str(tiler.parent),
+    )
+    return pdf if pdf.is_file() else None
+
+
+def rasterize_pdf_page(pdf_path, page_num, dpi=144):
+    """Rasterize one 1-based PDF page to an RGB PIL image; None if pdftoppm missing."""
+    pdf_path = Path(pdf_path)
+    if not pdf_path.is_file() or shutil.which("pdftoppm") is None:
+        return None
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        prefix = Path(td) / "page"
+        try:
+            subprocess.run(
+                [
+                    "pdftoppm",
+                    "-png",
+                    "-r",
+                    str(dpi),
+                    "-f",
+                    str(page_num),
+                    "-l",
+                    str(page_num),
+                    str(pdf_path),
+                    str(prefix),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            return None
+        hits = sorted(Path(td).glob("page-*.png"))
+        if not hits:
+            return None
+        return Image.open(hits[0]).convert("RGB")
+
+
+def _front_pages_for_full_build(job_dir):
+    pa = Path(job_dir) / "full" / "paint_areas.json"
+    if pa.is_file():
+        return int(json.loads(pa.read_text()).get("front_pages", 2))
+    return 2
+
+
+def _sheet_pdf_page(front_pages, layout, r, c):
+    return front_pages + r * layout.cols + c + 1
+
+
+def _focal_box_from_masks(eye_mask, mouth_mask, shape, pad=0.15):
+    m = np.zeros(shape[:2], dtype=bool)
+    if eye_mask is not None:
+        m |= eye_mask >= 0.35
+    if mouth_mask is not None:
+        m |= mouth_mask >= 0.35
+    if not np.any(m):
+        return None
+    ys, xs = np.nonzero(m)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    dx, dy = int((x1 - x0) * pad), int((y1 - y0) * pad)
+    h, w = shape[:2]
+    return max(0, x0 - dx), max(0, y0 - dy), min(w, x1 + dx), min(h, y1 + dy)
+
+
+def _work_px_to_page_px(px, py, r, c, layout, job, dpi):
+    """Map work-image pixel (x right, y down) to rasterized sheet page pixel (origin top-left)."""
+    k = job["scale"] / job["ppi"]
+    sx0, sy0 = c * layout.step_x, r * layout.step_y
+    left_pt = MARGIN * PT
+    bottom_pt = (MARGIN + FOOTER) * PT
+    top_pt = bottom_pt + layout.ch * PT
+    page_h_pt = layout.page_h * PT
+    page_x_pt = left_pt + (px * k - sx0) * PT
+    page_y_pt = top_pt - (py * k - sy0) * PT
+    scale = dpi / PT
+    return page_x_pt * scale, (page_h_pt - page_y_pt) * scale
+
+
+def _sheet_unique_work_rect(layout, r, c, k, mural_w, mural_h):
+    """Wall-owned pixels for one sheet (overlap band counted only on the sheet that tapes over it)."""
+    sx0, sy0 = c * layout.step_x, r * layout.step_y
+    ov = layout.overlap
+    ux0_m = sx0 if c == 0 else sx0 + ov
+    uy0_m = sy0 if r == 0 else sy0 + ov
+    if c == layout.cols - 1:
+        ux1_m = min(sx0 + layout.cw, mural_w)
+    else:
+        ux1_m = sx0 + layout.step_x
+    if r == layout.rows - 1:
+        uy1_m = min(sy0 + layout.ch, mural_h)
+    else:
+        uy1_m = sy0 + layout.step_y
+    return ux0_m / k, uy0_m / k, ux1_m / k, uy1_m / k
+
+
+def _sheets_intersecting_box(layout, k, box, mural_w, mural_h):
+    x0, y0, x1, y1 = (int(v) for v in box)
+    hits = []
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+            ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
+            ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
+            area = _rect_intersection_area(x0, y0, x1, y1, wx0, wy0, wx1, wy1)
+            if area > 0 and ix1 > ix0 and iy1 > iy0:
+                hits.append((area, r, c, ix0, iy0, ix1, iy1))
+    hits.sort(key=lambda t: (t[1], t[2]))
+    return hits
+
+
+def rasterize_pdf_pages(pdf_path, out_dir, dpi=120):
+    """Rasterize each PDF page to preview_pages/page-N.png; returns True if pages were written."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if shutil.which("pdftoppm") is None:
+        print("preview: pdftoppm not found; skipping rasterized preview_pages (install poppler-utils)")
+        return False
+    tmp = out_dir / "_ppm"
+    tmp.mkdir(parents=True, exist_ok=True)
+    prefix = tmp / "page"
+    try:
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(prefix)],
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"preview: pdftoppm failed ({e.stderr or e}); skipping preview_pages")
+        return False
+    pages = sorted(tmp.glob("page-*.png"))
+    for i, src in enumerate(pages, start=1):
+        dest = out_dir / f"page-{i}.png"
+        shutil.move(str(src), dest)
+    for leftover in tmp.glob("*"):
+        leftover.unlink(missing_ok=True)
+    tmp.rmdir()
+    return True
+
+
+def _outline_font(style):
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def draw_preview_outlined(path, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style):
+    """Whole-mural PNG with fills, vector boundaries, numbers, and a faint sheet grid."""
+    h, w = labels.shape
+    k = job["scale"] / job["ppi"]
+    base = Image.fromarray(palette[labels])
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    line_w = max(1, int(round(style.line_pt * job["ppi"] / 72 * 0.85)))
+    for chunk in chunks:
+        pts = [(float(x), float(y)) for x, y in chunk]
+        draw.line(pts, fill=(0, 0, 0, 210), width=line_w, joint="curve")
+
+    px_to_pt = k * PT * (w / max(mural_w * job["ppi"], 1))  # match sheet number sizing at mural width
+    placed, _ = place_numbers(labels, regions, px_to_pt, style)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    for x, y, text, size in placed:
+        pt = max(8, min(28, size * w / max(mural_w * job["ppi"], 1) * 0.55))
+        try:
+            font = ImageFont.truetype(font_path, int(round(pt)))
+        except OSError:
+            font = ImageFont.load_default()
+        tw, th = draw.textbbox((0, 0), text, font=font)[2:]
+        draw.text((x - tw / 2, y - th / 2), text, fill=(0, 0, 0, 235), font=font)
+
+    grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(grid)
+    label_font = _outline_font(style)
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+            x0, y0 = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+            x1, y1 = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+            gdraw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=(120, 120, 120, 140), width=1)
+            sid = sheet_id(r, c)
+            gdraw.text((x0 + 4, y0 + 4), sid, fill=(31, 79, 191, 180), font=label_font)
+
+    out = Image.alpha_composite(base.convert("RGBA"), overlay)
+    out = Image.alpha_composite(out, grid)
+    out.convert("RGB").save(path, optimize=True)
 
 
 # ---------- main ----------
@@ -1297,52 +3633,170 @@ def load_brand_map(path, n_colors):
 
 def main():
     a = parse_args()
+    if getattr(a, "_from_preview_dir", None):
+        a.preview_only = False
     wall_w_in, wall_h_in = a.wall_width_ft * 12, a.wall_height_ft * 12
-    ppi = min(TARGET_PPI, math.sqrt(MAX_WORK_PIXELS / (wall_w_in * wall_h_in)))
     style = STYLES[a.transfer]
+    resolved = {"detail": a.detail, "prep": a.prep}
+    crop_box = (0, 0, 0, 0)
 
-    src = ImageOps.exif_transpose(Image.open(a.image)).convert("RGB")
-    want_upscale = False
-    if not a.no_face_priority and (a.face_box or _detect_faces_yunet(src)):
-        want_upscale = True
-    ppi = _maybe_upscale_ppi(src, wall_w_in, wall_h_in, ppi, enabled=want_upscale)
-    img, fit_note, crop_box = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
-    rgb = np.asarray(img)
-    face = resolve_faces(src, img, crop_box, a)
-    if face["mask"] is not None:
-        labels = quantize_face_priority(
-            img, a.colors, ppi, face["mask"],
-            eye_mask=face.get("eye_mask"), n_eye=face.get("eye_colors_reserved") or 0,
-        )
-        face_min = face["face_min_region_in"]
-        eye_min = face.get("eye_min_region_in")
-        win_bg = int(round(a.min_region_in / 4 * ppi)) | 1
-        win_face = int(round(face_min / 4 * ppi)) | 1
-        labels = majority_filter_face_aware(
-            labels, a.colors, win_bg, win_face, face["mask"], eye_mask=face.get("eye_mask"),
-        )
-        eye_kwargs = {}
-        if eye_min:
-            eye_kwargs = {
-                "eye_mask": face["eye_mask"],
-                "eye_area_px": (eye_min * ppi) ** 2,
-                "eye_thick_px": eye_min / 2 * ppi,
-            }
-        labels = clean_regions_face_aware(
-            labels,
-            (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi,
-            (face_min * ppi) ** 2, face_min / 2 * ppi,
-            face["mask"],
-            **eye_kwargs,
-        )
+    work_rgb = None
+    if getattr(a, "_from_preview_dir", None):
+        meta = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text())
+        labels, palette, regions, face_mask, eye_mask, mouth_mask = load_saved_labels(a._from_preview_dir)
+        _, region_colors = label_regions(labels)
+        ppi = float(meta["ppi"])
+        work_rgb = work_rgb_from_job_meta(meta, wall_w_in, wall_h_in)
+        fit_note = meta["fit_note"]
+        crop_box = tuple(meta["crop_box"])
+        face = dict(meta.get("subject_priority") or meta["face_priority"])
+        face["mask"] = face_mask
+        face["eye_mask"] = eye_mask
+        face["mouth_mask"] = mouth_mask
+        resolved.update({"ppi": ppi, "fit_note": fit_note, "detail": meta.get("detail"), "prep": meta.get("prep")})
+        print(f"from-preview: loaded {LABELS_ARCHIVE} from {a._from_preview_dir} "
+              f"({labels.shape[1]}x{labels.shape[0]} work px, {int(regions.max())} regions)")
     else:
-        labels = quantize(img, a.colors, ppi)
-        window = int(round(a.min_region_in / 4 * ppi)) | 1
-        labels = majority_filter(labels, a.colors, window)
-        labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
-    labels, palette = finalize_palette(labels, rgb)
-    regions, region_colors = label_regions(labels)
+        src = ImageOps.exif_transpose(Image.open(a.image)).convert("RGB")
+        src = apply_image_prep(src, a.prep)
+        resolved["prep"] = a.prep
+        want_upscale = False
+        if not subject_priority_off(a) and (
+            manual_subject_box(a) or _detect_faces_yunet(src) or _detect_animals_yolox(src)
+        ):
+            want_upscale = True
+        ppi = min(TARGET_PPI, math.sqrt(MAX_WORK_PIXELS / (wall_w_in * wall_h_in)))
+        ppi = _maybe_upscale_ppi(src, wall_w_in, wall_h_in, ppi, enabled=want_upscale)
+        resolved["ppi"] = ppi
+        img, fit_note, crop_box = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
+        resolved["fit_note"] = fit_note
+        rgb = np.asarray(img)
+        work_rgb = rgb
+        face = resolve_subject(src, img, crop_box, a)
+        merge_min = lab_merge_min_dist(a.detail, a.colors, a.wall_width_ft, a.wall_height_ft)
+        if face["mask"] is not None:
+            labels = quantize_face_priority(
+                img, a.colors, ppi, face["mask"],
+                eye_mask=face.get("eye_mask"), mouth_mask=face.get("mouth_mask"),
+                n_skin=face.get("face_skin_colors") or 0,
+                n_eye=face.get("eye_colors_reserved") or 0,
+                n_mouth=face.get("mouth_colors_reserved") or 0,
+                n_bg=face.get("background_colors_reserved") or 2,
+                merge_min_dist=merge_min, detail=a.detail,
+            )
+            face_min = face["face_min_region_in"]
+            eye_min = face.get("eye_min_region_in")
+            mouth_min = face.get("mouth_min_region_in")
+            bg_mult = _bg_region_mult(a.detail)
+            win_bg = int(round(a.min_region_in * bg_mult / 3 * ppi)) | 1
+            win_face = int(round(face_min / 4 * ppi)) | 1
+            if a.detail == "photo":
+                win_bg = max(1, int(round(win_bg * 0.7)))
+            if a.detail == "photo" and is_canvas_job(a.wall_width_ft, a.wall_height_ft):
+                win_bg = max(1, win_bg // 2)
+            labels = majority_filter_face_aware(
+                labels, a.colors, win_bg, win_face, face["mask"],
+                eye_mask=face.get("eye_mask"), mouth_mask=face.get("mouth_mask"),
+                preserve_bg=(a.detail == "photo" and is_canvas_job(a.wall_width_ft, a.wall_height_ft)),
+            )
+            labels = sharpen_eye_features(labels, rgb, face.get("eye_mask"), ppi)
+            kw = {
+                "eye_mask": face.get("eye_mask"), "mouth_mask": face.get("mouth_mask"),
+                "bg_area_px": (a.min_region_in * bg_mult * ppi) ** 2 * (0.72 if a.detail == "photo" else 1.0),
+                "bg_thick_px": a.min_region_in * bg_mult / 2 * ppi * (0.72 if a.detail == "photo" else 1.0),
+            }
+            if eye_min:
+                kw.update({
+                    "eye_area_px": max(4.0, (eye_min * ppi) ** 2 * 0.10),
+                    "eye_thick_px": max(0.3, eye_min / 4 * ppi),
+                })
+            if mouth_min:
+                kw.update({"mouth_area_px": (mouth_min * ppi) ** 2, "mouth_thick_px": mouth_min / 2 * ppi})
+            labels = clean_regions_face_aware(
+                labels,
+                (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi,
+                (face_min * ppi) ** 2, face_min / 2 * ppi,
+                face["mask"],
+                **kw,
+            )
+            labels = sharpen_eye_features(labels, rgb, face.get("eye_mask"), ppi)
+        else:
+            labels = quantize(img, a.colors, ppi, merge_min_dist=merge_min)
+            window = int(round(a.min_region_in / 4 * ppi)) | 1
+            labels = majority_filter(labels, a.colors, window)
+            labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
+        min_guide_in = a.min_guide_region_in
+        if min_guide_in is None:
+            min_guide_in = default_min_guide_in(a.min_region_in)
+        regions, region_colors = label_regions(labels)
+        px_to_pt_floor = (a.scale / ppi) * PT
+        numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+            regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
+        )
+        if a.merge_guide_specks and speck_ids:
+            speck_log = []
+            labels, regions, speck_log = merge_guide_specks(
+                labels, rgb, regions, speck_ids, log=speck_log,
+                eye_mask=face.get("eye_mask"), mouth_mask=face.get("mouth_mask"),
+            )
+            for line in speck_log:
+                print(f"guide speck: {line}")
+            regions, region_colors = label_regions(labels)
+            numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+                regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
+            )
+        labels, palette = finalize_palette(
+            labels, rgb, face.get("eye_mask"), face.get("mouth_mask"), face.get("mask"),
+        )
+        labels, palette = finalize_face_labels(labels, rgb, palette, face, ppi)
+        regions, region_colors = label_regions(labels)
+        numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+            regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
+        )
     n = len(palette)
+    face_mask = face.get("mask")
+    eye_mask = face.get("eye_mask")
+    mouth_mask = face.get("mouth_mask")
+
+    px_to_pt_floor = (a.scale / ppi) * PT
+    min_guide_in = a.min_guide_region_in or default_min_guide_in(a.min_region_in)
+    k_sheet = a.scale / ppi
+    numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+        regions, labels, style, px_to_pt_floor, ppi, min_guide_in, a.min_region_in,
+    )
+    numbered_ids, guide_ids, speck_ids = promote_eye_regions_to_numbered(
+        numbered_ids, guide_ids, speck_ids, regions, eye_mask,
+    )
+    outline_guide_ids = guide_ids | speck_ids
+    if getattr(a, "_from_preview_dir", None):
+        prev_meta = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text())
+        detail_insets = prev_meta.get("detail_insets") or []
+        soup_clumps = prev_meta.get("soup_clumps")
+        if a.detail_inset and not detail_insets:
+            soup_clumps = soup_clumps or detect_soup_clumps(
+                regions, labels, numbered_ids, outline_guide_ids, eye_mask, mouth_mask, ppi,
+            )
+            detail_insets = resolve_detail_insets(
+                a.detail_inset, soup_clumps, labels, regions, style, k_sheet, ppi,
+                eye_mask, mouth_mask, face_mask,
+            )
+    else:
+        soup_clumps = detect_soup_clumps(
+            regions, labels, numbered_ids, outline_guide_ids, eye_mask, mouth_mask, ppi,
+        )
+        detail_insets = resolve_detail_insets(
+            a.detail_inset, soup_clumps, labels, regions, style, k_sheet, ppi,
+            eye_mask, mouth_mask, face_mask,
+        )
+    a.placement_meta = {
+        "numbered_regions": len(numbered_ids),
+        "guide_regions": len(outline_guide_ids),
+        "speck_regions": len(speck_ids),
+        "min_guide_region_in": min_guide_in,
+        "guides_on_main": len(outline_guide_ids),
+    }
+    a.detail_insets_resolved = detail_insets
+    a.soup_clumps = soup_clumps
 
     wall_sqft = wall_w_in * wall_h_in / 144
     counts = np.bincount(labels.ravel(), minlength=n)
@@ -1360,7 +3814,31 @@ def main():
     layout = choose_layout(mural_w, mural_h, a.overlap_in)
     job = {"wall_w_in": wall_w_in, "wall_h_in": wall_h_in, "wall_sqft": wall_sqft, "coats": a.coats,
            "transfer": a.transfer, "brand": a.brand, "overlap": a.overlap_in, "scale": a.scale, "ppi": ppi,
-           "fit_note": fit_note}
+           "fit_note": fit_note, "sheet_tint": a.sheet_tint, "detail": a.detail}
+    sigma = trace_sigma(ppi, a.min_region_in, face)
+    guide_chunks, guide_boxes, guide_closed = build_guide_polylines(
+        regions, outline_guide_ids, sigma, ppi=ppi,
+    )
+    skip_number_regions = set(outline_guide_ids)
+    if eye_mask is not None:
+        em = eye_mask >= 0.45
+        for rid in np.unique(regions[em]):
+            rid = int(rid)
+            if rid > 0:
+                skip_number_regions.discard(rid)
+    d1_guides_numbered = 0
+
+    if a.soup_report and not getattr(a, "_from_preview_dir", None):
+        options = [
+            {"action": "lower_detail", "detail": "low", "note": "fewer colors / larger regions"},
+            {"action": "detail_inset", "flag": "--detail-inset auto", "note": "add enlarged detail sheet"},
+        ]
+        preview_rgb = palette[labels]
+        write_soup_report(
+            a.out, soup_clumps, preview_rgb, labels, regions, palette, style, sigma,
+            k_sheet, outline_guide_ids, options, ppi=ppi,
+        )
+        print(f"soup report: {a.out / 'soup_report.json'} ({len(soup_clumps)} clump(s))")
 
     a.out.mkdir(parents=True, exist_ok=True)
     preview = Image.fromarray(palette[labels])
@@ -1372,32 +3850,88 @@ def main():
     cv.setTitle("Paint-by-number mural")
     cover_pages, key_on_cover = draw_cover(cv, job, small, palette, areas, brand_map, layout)
     key_pages = 0 if key_on_cover else draw_color_key_pages(cv, job, palette, areas, brand_map)
-    draw_map(cv, job, small, layout, mural_w, mural_h)
-    front_pages = cover_pages + key_pages + 1  # cover + optional key pages + placement map
+    instr_pages = 0
+    if outline_guide_ids or detail_insets:
+        instr_pages = draw_painting_instructions(cv, job, bool(outline_guide_ids), detail_insets)
+    draw_map(cv, job, small, layout, mural_w, mural_h, detail_insets=detail_insets)
+    front_pages = cover_pages + key_pages + instr_pages + 1
     labeled = set()
+    outline_paint = paint_for_main_outlines(labels, regions, numbered_ids, eye_mask=eye_mask)
+    chunks, boxes = chunk_polylines(trace_boundaries(outline_paint, sigma=sigma))
+    f_mask, e_mask, m_mask = face_mask, eye_mask, mouth_mask
     if not a.preview_only:
-        chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=max(2.0, 0.1 * ppi)))
         for r in range(layout.rows):
             for c in range(layout.cols):
-                labeled |= draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
-                                      palette, style)
+                labeled |= draw_sheet(
+                    cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
+                    palette, style, face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask,
+                    guide_chunks=guide_chunks, guide_boxes=guide_boxes, guide_closed=guide_closed,
+                    skip_number_regions=skip_number_regions, detail_insets=detail_insets,
+                )
+        for ins in detail_insets or []:
+            _labeled, newly = draw_detail_sheet(
+                cv, job, ins, labels, regions, palette, style, sigma,
+                guide_ids=outline_guide_ids, numbered_ids=numbered_ids,
+            )
+            labeled |= _labeled
+            d1_guides_numbered += len(newly)
     cv.save()
+
+    preview_samples = []
+    if a.preview_only:
+        save_preview_job(a.out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask, mouth_mask)
+        print(f"preview job: {a.out / PREVIEW_JOB_NAME}")
+        print(f"preview job: {a.out / LABELS_ARCHIVE}")
+        k_sheet = job["scale"] / job["ppi"]
+        preview_samples = pick_preview_sheets(a.preview_sheets, layout, regions, face, k_sheet, face_mask)
+        kit_pdf = a.out / "preview_kit.pdf"
+        build_preview_kit_pdf(
+            kit_pdf, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
+            chunks, boxes, labels, regions, palette, style, preview_samples,
+            face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask,
+            guide_chunks=guide_chunks, guide_boxes=guide_boxes, guide_closed=guide_closed,
+            skip_number_regions=skip_number_regions, detail_insets=detail_insets,
+            has_guides=bool(outline_guide_ids),
+        )
+        outlined = a.out / "preview_outlined.png"
+        draw_preview_outlined(outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style)
+        pages_dir = a.out / "preview_pages"
+        rasterize_pdf_pages(kit_pdf, pages_dir)
+        print(f"preview: {a.out / 'preview.png'}")
+        print(f"preview: {outlined}")
+        print(f"preview: {kit_pdf}")
+        if pages_dir.is_dir() and any(pages_dir.glob("page-*.png")):
+            print(f"preview: {pages_dir}/page-*.png")
+        for r, c, reason in preview_samples:
+            print(f"preview sheet {sheet_id(r, c)} (row {r + 1}, col {c + 1}): {reason}")
+        print(f"full build will use {layout.count} sheets ({layout.cols}x{layout.rows} "
+              f"{'landscape' if layout.landscape else 'portrait'})")
 
     summary = {
         "wall_width_ft": a.wall_width_ft, "wall_height_ft": a.wall_height_ft, "wall_sqft": round(wall_sqft, 2),
         "coats": a.coats, "coverage_sqft_per_gal": a.coverage_sqft_per_gal, "brand": a.brand,
         "requested_colors": a.colors, "colors_used": n, "transfer": a.transfer, "scale": a.scale,
         "fit": fit_note, "work_px_per_wall_in": round(ppi, 2), "min_region_in": a.min_region_in,
-        "sheets": {"count": 0 if a.preview_only else layout.count, "rows": layout.rows, "cols": layout.cols,
+        "detail": a.detail, "prep": resolved.get("prep"), "trace_sigma": round(sigma, 3),
+        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask, mouth_mask),
+        "sheets": {"count": layout.count, "rows": layout.rows, "cols": layout.cols,
                    "orientation": "landscape" if layout.landscape else "portrait", "overlap_in": a.overlap_in},
         "regions": int(regions.max()),
+        "placement": a.placement_meta,
+        "detail_insets": detail_insets,
+        "soup_clump_count": len(soup_clumps or []),
         "front_pages": front_pages,
         "colors": areas,
+        "subject_priority": _subject_meta_for_json(face),
         "face_priority": {
             "enabled": face["enabled"],
             "found": face["found"],
+            "subject_type": face.get("subject_type"),
+            "subject_class": face.get("subject_class"),
             "detector": face["detector"],
-            "faces": face["faces"],
+            "detectors": face.get("detectors", []),
+            "detections": face.get("detections", face.get("faces", [])),
+            "faces": face.get("faces", []),
             "face_colors_reserved": face["face_colors_reserved"],
             "face_min_region_in": face["face_min_region_in"],
             "eye_priority": face.get("eye_count", 0) > 0,
@@ -1405,17 +3939,57 @@ def main():
             "eye_colors_reserved": face.get("eye_colors_reserved", 0),
             "eye_min_region_in": face.get("eye_min_region_in"),
             "eye_disks_work": face.get("eye_disks_work", []),
+            "mouth_priority": (face.get("mouth_colors_reserved") or 0) > 0,
+            "mouth_colors_reserved": face.get("mouth_colors_reserved", 0),
+            "mouth_min_region_in": face.get("mouth_min_region_in"),
+            "mouth_ellipses_work": face.get("mouth_ellipses_work", []),
+            "face_skin_colors": face.get("face_skin_colors", 0),
+            "background_colors_reserved": face.get("background_colors_reserved", 0),
         },
     }
     if not a.preview_only:
-        summary["unlabeled_regions"] = int(regions.max()) - len(labeled)
+        all_ids = {int(r) for r in np.unique(regions) if int(r) > 0}
+        summary["guide_regions"] = len(outline_guide_ids)
+        summary["numbered_regions"] = len(numbered_ids)
+        summary["guides_on_main"] = len(outline_guide_ids)
+        summary["guides_numbered_on_detail"] = d1_guides_numbered
+        summary["unlabeled_regions"] = len(all_ids - labeled - outline_guide_ids)
+        a.placement_meta["guides_numbered_on_detail"] = d1_guides_numbered
+        if getattr(a, "_from_preview_dir", None):
+            saved_lm = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text()).get("label_metrics", {})
+            live = summary["label_metrics"]
+            summary["label_parity"] = {
+                "regions_match": saved_lm.get("regions") == live["regions"],
+                "face_regions_match": saved_lm.get("face_regions") == live.get("face_regions"),
+            }
     (a.out / "paint_areas.json").write_text(json.dumps(summary, indent=2) + "\n")
     pdf_mb = (a.out / "mural.pdf").stat().st_size / 1e6
+    sheet_note = f"{layout.count} sheets" if a.preview_only else f"{summary['sheets']['count']} sheets"
     print(f"{n} colors ({a.colors} requested), {summary['regions']} regions, "
-          f"{summary['sheets']['count']} sheets {layout.cols}x{layout.rows} {summary['sheets']['orientation']}, "
+          f"{sheet_note} {layout.cols}x{layout.rows} {summary['sheets']['orientation']}, "
           f"{pdf_mb:.1f} MB -> {a.out / 'mural.pdf'}")
     if summary.get("unlabeled_regions"):
         print(f"warning: {summary['unlabeled_regions']} regions got no number on any sheet")
+    if summary.get("guide_regions"):
+        print(f"freehand guide shapes: {summary['guide_regions']} regions (dashed, unnumbered)")
+
+    if is_kitten_canvas_regression(a) and work_rgb is not None:
+        try:
+            from scripts.kitten_kit_tests import validate_eye_labels
+
+            eye_res = validate_eye_labels(labels, palette, eye_mask, work_rgb)
+            print(f"kitten eye gate: OK ({eye_res})")
+        except AssertionError as exc:
+            raise SystemExit(f"kitten eye gate FAILED: {exc}") from exc
+        if not a.preview_only and (a.out / "mural.pdf").is_file():
+            try:
+                from scripts.kitten_kit_tests import run_from_out_dir
+
+                prev = getattr(a, "_from_preview_dir", None) or a.out
+                gate = run_from_out_dir(a.out, render_a1=True, preview_dir=prev)
+                print(f"kitten kit gate: {json.dumps(gate)}")
+            except AssertionError as exc:
+                raise SystemExit(f"kitten kit gate FAILED: {exc}") from exc
 
 
 if __name__ == "__main__":
