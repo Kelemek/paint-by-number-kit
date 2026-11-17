@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Compare preview vs full-build parity across skill detail levels."""
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMG = ROOT / "test_assets" / "preview_face.png"
-FACE = "120,80,360,480"
+IMG = Path(os.environ.get("PARITY_IMAGE", ROOT / "test_assets" / "preview_face.png"))
+if "PARITY_FACE_BOX" in os.environ:
+    FACE = os.environ["PARITY_FACE_BOX"]
+elif Path(os.environ.get("PARITY_IMAGE", ROOT / "test_assets/preview_face.png")).name == "preview_face.png":
+    FACE = "120,80,360,480"
+else:
+    FACE = ""
 
 
 def run(cmd):
@@ -35,24 +41,34 @@ def main():
         return 1
     levels = ["low", "medium", "high", "photo"]
     sizes = [("wall", 8, 6), ("canvas", 2, 1.5)]
-    print("level,size,preview_regions,full_regions,unlabeled,face_regions,parity,trace_sigma")
+    print("level,size,preview_regions,full_regions,unlabeled,face_regions,parity,trace_sigma,monotonic_ok")
+    failed_mono = False
+    prev_by_size = {name: 0 for name, _, _ in sizes}
     for level in levels:
         for name, w, h in sizes:
             base = Path(f"/tmp/parity_{name}_{level}")
             base.mkdir(parents=True, exist_ok=True)
-            run([
+            cmd = [
                 "python3", "mural_tiler.py",
-                "--image", str(IMG), "--face-box", FACE,
+                "--image", str(IMG),
                 "--wall-width-ft", str(w), "--wall-height-ft", str(h),
                 "--detail", level, "--preview-only", "--out", str(base),
-            ])
+            ]
+            if FACE:
+                cmd.extend(["--face-box", FACE])
+            run(cmd)
             run(["python3", "mural_tiler.py", "--from-preview", str(base), "--out", str(base / "full")])
             prev = metrics(base)
             full = metrics(base / "full", base)
             ok = full["parity"] and full["parity"].get("regions_match")
+            mono = full["regions"] >= prev_by_size[name]
+            if not mono:
+                failed_mono = True
+                print(f"  MONOTONIC FAIL: {level} {name} has {full['regions']} regions < {prev_by_size[name]}")
+            prev_by_size[name] = max(prev_by_size[name], full["regions"])
             print(
                 f"{level},{name},{prev['regions']},{full['regions']},{full['unlabeled']},"
-                f"{full['face_regions']},{ok},{full['trace_sigma']}"
+                f"{full['face_regions']},{ok},{full['trace_sigma']},{mono}"
             )
             # Manual mismatch probe: rerun without detail/prep/face-box (simulates organizer typo)
             mismatch = Path(f"/tmp/parity_{name}_{level}_mismatch")
@@ -66,7 +82,7 @@ def main():
             ])
             bad = json.loads((mismatch / "paint_areas.json").read_text())["regions"]
             print(f"  mismatch_rerun_regions={bad} (preview had {prev['regions']})")
-    return 0
+    return 1 if failed_mono else 0
 
 
 if __name__ == "__main__":

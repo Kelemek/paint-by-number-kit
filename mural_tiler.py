@@ -71,7 +71,7 @@ DETAIL_LEVELS = {
     "low": {"colors": 8, "wall_min_region_in": 3.0, "canvas_min_region_pct": 2.8, "prep": "soften"},
     "medium": {"colors": 12, "wall_min_region_in": 2.0, "canvas_min_region_pct": 1.9, "prep": "balance"},
     "high": {"colors": 20, "wall_min_region_in": 1.2, "canvas_min_region_pct": 1.1, "prep": "sharpen"},
-    "photo": {"colors": 30, "wall_min_region_in": 0.8, "canvas_min_region_pct": 0.8, "prep": "none"},
+    "photo": {"colors": 30, "wall_min_region_in": 0.8, "canvas_min_region_pct": 0.8, "prep": "photo"},
 }
 CANVAS_SHORT_FT = 4.0
 PREVIEW_JOB_VERSION = 1
@@ -108,6 +108,15 @@ def is_canvas_job(wall_w_ft, wall_h_ft):
     return min(wall_w_ft, wall_h_ft) < CANVAS_SHORT_FT
 
 
+def lab_merge_min_dist(detail, n_colors, wall_w_ft=None, wall_h_ft=None):
+    """Allow closer Lab centers at higher detail so photo never collapses below high."""
+    if detail:
+        if detail == "photo" and wall_w_ft is not None and not is_canvas_job(wall_w_ft, wall_h_ft):
+            return 1.2
+        return {"low": 3.5, "medium": 3.0, "high": 2.2, "photo": 1.0}[detail]
+    return max(1.5, 4.0 - 0.085 * n_colors)
+
+
 def min_region_for_detail(detail, wall_w_ft, wall_h_ft):
     spec = DETAIL_LEVELS[detail]
     if is_canvas_job(wall_w_ft, wall_h_ft):
@@ -120,6 +129,10 @@ def prep_for_detail(detail):
     return DETAIL_LEVELS[detail]["prep"] if detail else "none"
 
 
+def prep_choices():
+    return ("auto", "none", "soften", "balance", "sharpen", "photo")
+
+
 def apply_image_prep(img, prep):
     if prep == "none":
         return img
@@ -130,6 +143,9 @@ def apply_image_prep(img, prep):
         return ImageOps.autocontrast(img, cutoff=1)
     if prep == "sharpen":
         return ImageOps.autocontrast(img.filter(ImageFilter.SHARPEN), cutoff=0.5)
+    if prep == "photo":
+        base = ImageOps.autocontrast(img, cutoff=0.5)
+        return base.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=3))
     raise ValueError(f"unknown prep {prep!r}")
 
 
@@ -270,7 +286,7 @@ def parse_args():
     p.add_argument("--colors", type=int, help="paint colors; set automatically with --detail")
     p.add_argument("--detail", choices=sorted(DETAIL_LEVELS),
                    help="skill detail level (sets --colors and --min-region-in when not passed)")
-    p.add_argument("--prep", choices=("auto", "none", "soften", "balance", "sharpen"), default="auto",
+    p.add_argument("--prep", choices=prep_choices(), default="auto",
                    help="source image prep before tiling (auto follows --detail)")
     p.add_argument("--coats", type=int, choices=(1, 2), default=2, help="recorded for paint_math.py and shown on the cover")
     p.add_argument("--coverage-sqft-per-gal", type=float, default=375.0, help="recorded for paint_math.py")
@@ -635,12 +651,21 @@ def _kmeans_lab(pixels, n, seed=SEED, weight_exp=0.5):
     return km.cluster_centers_
 
 
-def _merge_close_lab(centers, min_dist=3.5):
+def _merge_close_lab(centers, min_dist=3.5, target_count=0):
     kept = []
     for c in centers:
         if all(np.linalg.norm(c - k) >= min_dist for k in kept):
             kept.append(c)
-    return np.array(kept) if kept else np.zeros((0, 3))
+    out = np.array(kept) if kept else np.zeros((0, 3))
+    if target_count > len(out) and len(out) < len(centers):
+        extra = [c for c in centers
+                 if not any(np.linalg.norm(c - k) < min_dist for k in out)]
+        for c in extra:
+            if len(out) >= target_count:
+                break
+            if all(np.linalg.norm(c - k) >= min_dist * 0.55 for k in out):
+                out = np.vstack([out, c])
+    return out
 
 
 def _assign_nearest_lab(rgb, centers_lab):
@@ -649,9 +674,11 @@ def _assign_nearest_lab(rgb, centers_lab):
     return np.sqrt((delta * delta).sum(-1)).argmin(-1).astype(np.int32)
 
 
-def _median_composite(img, face_mask, ppi, eye_mask=None):
+def _median_composite(img, face_mask, ppi, eye_mask=None, colors=8):
     """Stronger noise filter in the background, weaker in the face, none in the eyes."""
     bg_k = 2 * int(0.1 * ppi) + 1
+    if colors >= 24:
+        bg_k = max(3, bg_k - 2)
     face_k = 2 * int(0.04 * ppi) + 1
     orig = np.asarray(img)
     bg = np.asarray(img.filter(ImageFilter.MedianFilter(bg_k)))
@@ -682,7 +709,7 @@ def _clahe_eyes(rgb, eye_mask, clip=2.0, tile=4):
     return np.rint(enhanced * m + rgb * (1 - m)).astype(np.uint8)
 
 
-def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0):
+def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0, merge_min_dist=3.5):
     """Reserve palette slots for eyes, then the face, then the background; total stays at N.
 
     Cluster centers are taken from the un-enhanced image so paint colors stay true to the
@@ -690,7 +717,7 @@ def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0):
     separate from lens glare, and is locked to the reserved eye centers so it doesn't
     collapse into hair or skin.
     """
-    mixed = _median_composite(img, face_mask, ppi, eye_mask)
+    mixed = _median_composite(img, face_mask, ppi, eye_mask, colors=n)
     n_eye = n_eye if eye_mask is not None and n_eye > 0 else 0
     n_face = min(n - n_eye - 2, max(FACE_MIN_COLORS, int(round(FACE_COLOR_SHARE * n))))
     n_face = max(1, min(n_face, n - n_eye - 1))
@@ -700,9 +727,10 @@ def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0):
     bg_pix = mixed[face_mask < 0.5].reshape(-1, 3)
     parts = []
     n_eye_kept = 0
+    merge = merge_min_dist
     if n_eye and len(eye_pix) >= n_eye:
         # Lower weight exponent so a small pupil can still earn its own cluster.
-        eye_c = _merge_close_lab(_kmeans_lab(eye_pix, n_eye, SEED, weight_exp=0.25))
+        eye_c = _merge_close_lab(_kmeans_lab(eye_pix, n_eye, SEED, weight_exp=0.25), min_dist=merge)
         parts.append(eye_c)
         n_eye_kept = len(eye_c)
     if len(face_pix):
@@ -710,26 +738,26 @@ def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0):
     if len(bg_pix):
         parts.append(_kmeans_lab(bg_pix, n_bg, SEED + 2))
     if not parts:
-        return quantize(Image.fromarray(mixed), n, ppi)
-    centers = _merge_close_lab(np.vstack(parts))
+        return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
+    centers = _merge_close_lab(np.vstack(parts), min_dist=merge, target_count=n)
     # Fill slots freed by merging, preferring leftover eye then face variation.
     # New unique eye extras stay at the end of the kept list; count them as eye colors.
     if len(centers) < n and len(eye_pix):
         before = len(centers)
         extra = _kmeans_lab(eye_pix, n_eye + (n - len(centers)), SEED + 3, weight_exp=0.25)
-        centers = _merge_close_lab(np.vstack([centers, extra]))
+        centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
         n_eye_kept += max(0, len(centers) - before)
     if len(centers) < n and len(face_pix):
         extra = _kmeans_lab(face_pix, n_face + (n - len(centers)), SEED + 4)
-        centers = _merge_close_lab(np.vstack([centers, extra]))
+        centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
     if len(centers) < n:
         extra = _kmeans_lab(mixed.reshape(-1, 3), n, SEED + 5)
-        centers = _merge_close_lab(np.vstack([centers, extra]))
+        centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
     if len(centers) > n:
         centers = centers[:n]
         n_eye_kept = min(n_eye_kept, len(centers))
     if len(centers) < 2:
-        return quantize(Image.fromarray(mixed), n, ppi)
+        return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
     labels = _assign_nearest_lab(mixed, centers)
     # Inside the eye disks, assign against a contrast-lifted view but only to reserved eye colors.
     if n_eye_kept >= 2:
@@ -740,11 +768,11 @@ def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, n_eye=0):
     return labels
 
 
-def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=None):
+def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=None, preserve_bg=False):
     """Fine majority inside the face, none in the eyes, coarser in the background; smooth seams."""
     fine = majority_filter(labels, n, max(1, win_face))
     coarse = majority_filter(labels, n, max(1, win_bg))
-    out = np.where(face_mask >= 0.35, fine, coarse)
+    out = np.where(face_mask >= 0.35, fine, labels if preserve_bg else coarse)
     if eye_mask is not None:
         # Leave eye pixels unsmoothed so a pupil or frame line isn't majority-voted away.
         out = np.where(eye_mask >= 0.35, labels, out)
@@ -823,7 +851,7 @@ def rgb_to_lab(rgb):
     return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], axis=-1)
 
 
-def quantize(img, n, ppi):
+def quantize(img, n, ppi, merge_min_dist=3.5):
     """K-means in Lab space on a median-filtered copy (removes noise, keeps edges crisp so
     antialiased edge pixels don't become a color of their own).
 
@@ -1379,31 +1407,6 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     def to_page(x_px, y_px):
         return left + (x_px * k - sx0) * PT, top - (y_px * k - sy0) * PT
 
-    # Overlap bands shared with existing neighbors.
-    cv.setFillColor(BAND)
-    if c > 0:
-        cv.rect(left, bottom, ov, ch, fill=1, stroke=0)
-    if c < layout.cols - 1:
-        cv.rect(left + cw - ov, bottom, ov, ch, fill=1, stroke=0)
-    if r > 0:
-        cv.rect(left, top - ov, cw, ov, fill=1, stroke=0)
-    if r < layout.rows - 1:
-        cv.rect(left, bottom, cw, ov, fill=1, stroke=0)
-
-    # Paper beyond the wall's right/bottom edge.
-    wall_r = left + (mural_w - sx0) * PT
-    wall_b = top - (mural_h - sy0) * PT
-    cv.setFillColor(OFF_WALL)
-    if wall_r < left + cw:
-        cv.rect(wall_r, bottom, left + cw - wall_r, ch, fill=1, stroke=0)
-    if wall_b > bottom:
-        cv.rect(left, bottom, cw, wall_b - bottom, fill=1, stroke=0)
-
-    sid = sheet_id(r, c)
-    cv.setFillColor(HexColor("#dbe4f6"))
-    cv.setFont("Helvetica-Bold", 40)
-    cv.drawString(left + ov + 6, top - ov - 42, sid)
-
     wx0, wy0 = sx0 / k, sy0 / k
     wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
     tint = float(job.get("sheet_tint", 0))
@@ -1419,6 +1422,31 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
             Image.fromarray(faded).save(buf, format="PNG")
             buf.seek(0)
             cv.drawImage(ImageReader(buf), left, bottom, cw, ch, preserveAspectRatio=False, anchor="sw")
+
+    # Paper beyond the wall's right/bottom edge.
+    wall_r = left + (mural_w - sx0) * PT
+    wall_b = top - (mural_h - sy0) * PT
+    cv.setFillColor(OFF_WALL)
+    if wall_r < left + cw:
+        cv.rect(wall_r, bottom, left + cw - wall_r, ch, fill=1, stroke=0)
+    if wall_b > bottom:
+        cv.rect(left, bottom, cw, wall_b - bottom, fill=1, stroke=0)
+
+    # Overlap bands on top of tint so registration stays visible.
+    cv.setFillColor(BAND)
+    if c > 0:
+        cv.rect(left, bottom, ov, ch, fill=1, stroke=0)
+    if c < layout.cols - 1:
+        cv.rect(left + cw - ov, bottom, ov, ch, fill=1, stroke=0)
+    if r > 0:
+        cv.rect(left, top - ov, cw, ov, fill=1, stroke=0)
+    if r < layout.rows - 1:
+        cv.rect(left, bottom, cw, ov, fill=1, stroke=0)
+
+    sid = sheet_id(r, c)
+    cv.setFillColor(HexColor("#dbe4f6"))
+    cv.setFont("Helvetica-Bold", 40)
+    cv.drawString(left + ov + 6, top - ov - 42, sid)
 
     # Region outlines (vector), clipped to the tile.
     cv.saveState()
@@ -1785,17 +1813,22 @@ def main():
         resolved["fit_note"] = fit_note
         rgb = np.asarray(img)
         face = resolve_faces(src, img, crop_box, a)
+        merge_min = lab_merge_min_dist(a.detail, a.colors, a.wall_width_ft, a.wall_height_ft)
         if face["mask"] is not None:
             labels = quantize_face_priority(
                 img, a.colors, ppi, face["mask"],
                 eye_mask=face.get("eye_mask"), n_eye=face.get("eye_colors_reserved") or 0,
+                merge_min_dist=merge_min,
             )
             face_min = face["face_min_region_in"]
             eye_min = face.get("eye_min_region_in")
             win_bg = int(round(a.min_region_in / 4 * ppi)) | 1
             win_face = int(round(face_min / 4 * ppi)) | 1
+            if a.detail == "photo" and is_canvas_job(a.wall_width_ft, a.wall_height_ft):
+                win_bg = max(1, win_bg // 2)
             labels = majority_filter_face_aware(
                 labels, a.colors, win_bg, win_face, face["mask"], eye_mask=face.get("eye_mask"),
+                preserve_bg=(a.detail == "photo" and is_canvas_job(a.wall_width_ft, a.wall_height_ft)),
             )
             eye_kwargs = {}
             if eye_min:
@@ -1812,7 +1845,7 @@ def main():
                 **eye_kwargs,
             )
         else:
-            labels = quantize(img, a.colors, ppi)
+            labels = quantize(img, a.colors, ppi, merge_min_dist=merge_min)
             window = int(round(a.min_region_in / 4 * ppi)) | 1
             labels = majority_filter(labels, a.colors, window)
             labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
