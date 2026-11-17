@@ -1,0 +1,17 @@
+{
+  "brand": "Example Paints",
+  "example_data": true,
+  "note": "EXAMPLE DATA: made-up names and codes to show the file format. Build the real palette from the chosen brand's published color list.",
+  "colors": [
+    {"name": "Example Lemon Glow", "code": "EX-101", "hex": "#fbe96a"},
+    {"name": "Example Apricot", "code": "EX-102", "hex": "#efc18a"},
+    {"name": "Example Sandstone", "code": "EX-103", "hex": "#c9b296"},
+    {"name": "Example Dove Gray", "code": "EX-104", "hex": "#a9a09c"},
+    {"name": "Example Harbor Blue", "code": "EX-105", "hex": "#8094ab"},
+    {"name": "Example Sky", "code": "EX-106", "hex": "#5a7cb5"},
+    {"name": "Example Meadow", "code": "EX-107", "hex": "#4a8d52"},
+    {"name": "Example Forest", "code": "EX-108", "hex": "#2a6232"},
+    {"name": "Example Bark", "code": "EX-109", "hex": "#5e4128"},
+    {"name": "Example Charcoal", "code": "EX-110", "hex": "#333333"}
+  ]
+}
