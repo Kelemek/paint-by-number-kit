@@ -24,6 +24,7 @@ import math
 import shutil
 import subprocess
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +66,19 @@ STYLES = {
     "template": Style(line_pt=2.0, line_gray=0.0, font="Helvetica-Bold", min_pt=9, max_pt=24),
 }
 
+# Skill detail levels: wall murals use fixed min-region inches; small canvases use % of short side.
+DETAIL_LEVELS = {
+    "low": {"colors": 8, "wall_min_region_in": 3.0, "canvas_min_region_pct": 2.8, "prep": "soften"},
+    "medium": {"colors": 12, "wall_min_region_in": 2.0, "canvas_min_region_pct": 1.9, "prep": "balance"},
+    "high": {"colors": 20, "wall_min_region_in": 1.2, "canvas_min_region_pct": 1.1, "prep": "sharpen"},
+    "photo": {"colors": 30, "wall_min_region_in": 0.8, "canvas_min_region_pct": 0.8, "prep": "none"},
+}
+CANVAS_SHORT_FT = 4.0
+PREVIEW_JOB_VERSION = 1
+TRACE_SIGMA_FRAC = 0.10   # cap smoothing vs smallest paintable feature
+PREVIEW_JOB_NAME = "preview_job.json"
+LABELS_ARCHIVE = "labels.npz"
+
 
 @dataclass(frozen=True)
 class Layout:
@@ -90,17 +104,181 @@ class Layout:
         return self.cols * self.rows
 
 
+def is_canvas_job(wall_w_ft, wall_h_ft):
+    return min(wall_w_ft, wall_h_ft) < CANVAS_SHORT_FT
+
+
+def min_region_for_detail(detail, wall_w_ft, wall_h_ft):
+    spec = DETAIL_LEVELS[detail]
+    if is_canvas_job(wall_w_ft, wall_h_ft):
+        short_in = min(wall_w_ft, wall_h_ft) * 12
+        return short_in * spec["canvas_min_region_pct"] / 100.0
+    return spec["wall_min_region_in"]
+
+
+def prep_for_detail(detail):
+    return DETAIL_LEVELS[detail]["prep"] if detail else "none"
+
+
+def apply_image_prep(img, prep):
+    if prep == "none":
+        return img
+    if prep == "soften":
+        base = img.filter(ImageFilter.GaussianBlur(radius=0.8))
+        return ImageOps.autocontrast(base, cutoff=1)
+    if prep == "balance":
+        return ImageOps.autocontrast(img, cutoff=1)
+    if prep == "sharpen":
+        return ImageOps.autocontrast(img.filter(ImageFilter.SHARPEN), cutoff=0.5)
+    raise ValueError(f"unknown prep {prep!r}")
+
+
+def apply_detail_and_prep_defaults(a):
+    if a.detail:
+        spec = DETAIL_LEVELS[a.detail]
+        if a.colors is None:
+            a.colors = spec["colors"]
+        if a.min_region_in is None:
+            a.min_region_in = min_region_for_detail(a.detail, a.wall_width_ft, a.wall_height_ft)
+    if a.prep == "auto":
+        a.prep = prep_for_detail(a.detail) if a.detail else "none"
+
+
+def merge_from_preview_args(a, parser):
+    job_path = a.from_preview / PREVIEW_JOB_NAME
+    if not job_path.is_file():
+        parser.error(f"--from-preview missing {PREVIEW_JOB_NAME}")
+    saved = json.loads(job_path.read_text())
+    if saved.get("version") != PREVIEW_JOB_VERSION:
+        parser.error(f"unsupported {PREVIEW_JOB_NAME} version")
+    a._from_preview_dir = a.from_preview
+    cli = saved.get("argv", {})
+    path_keys = {"image", "palette_json"}
+    for key, val in cli.items():
+        if key in ("out", "preview_only", "preview_sheets", "from_preview"):
+            continue
+        if getattr(a, key, None) is None and val is not None:
+            if key in path_keys:
+                setattr(a, key, Path(val))
+            else:
+                setattr(a, key, val)
+    if a.wall_width_ft is None:
+        a.wall_width_ft = saved["wall_width_ft"]
+    if a.wall_height_ft is None:
+        a.wall_height_ft = saved["wall_height_ft"]
+    if a.colors is None:
+        a.colors = saved["colors"]
+    if a.min_region_in is None:
+        a.min_region_in = saved["min_region_in"]
+
+
+def trace_sigma(ppi, min_region_in, face=None):
+    raw = max(1.0, 0.1 * ppi)
+    finest_in = float(min_region_in)
+    if face and face.get("eye_min_region_in"):
+        finest_in = min(finest_in, float(face["eye_min_region_in"]))
+    elif face and face.get("face_min_region_in"):
+        finest_in = min(finest_in, float(face["face_min_region_in"]))
+    cap = max(1.0, TRACE_SIGMA_FRAC * finest_in * ppi)
+    return min(raw, cap)
+
+
+def label_metrics(labels, regions, face_mask, eye_mask):
+    n_reg = int(regions.max())
+    face_pix = float((face_mask >= 0.35).sum()) if face_mask is not None else 0.0
+    eye_pix = float((eye_mask >= 0.35).sum()) if eye_mask is not None else 0.0
+    face_regs, eye_regs = set(), set()
+    if face_pix:
+        face_regs = set(np.unique(regions[face_mask >= 0.35]).tolist()) - {0}
+    if eye_pix:
+        eye_regs = set(np.unique(regions[eye_mask >= 0.35]).tolist()) - {0}
+    return {
+        "regions": n_reg,
+        "face_regions": len(face_regs),
+        "eye_regions": len(eye_regs),
+        "face_regions_per_10k_px": round(len(face_regs) / face_pix * 10_000, 2) if face_pix else 0.0,
+    }
+
+
+def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask):
+    argv = {
+        "image": str(a.image) if a.image else None,
+        "wall_width_ft": a.wall_width_ft,
+        "wall_height_ft": a.wall_height_ft,
+        "colors": a.colors,
+        "coats": a.coats,
+        "coverage_sqft_per_gal": a.coverage_sqft_per_gal,
+        "overlap_in": a.overlap_in,
+        "min_region_in": a.min_region_in,
+        "transfer": a.transfer,
+        "brand": a.brand,
+        "scale": a.scale,
+        "no_face_priority": a.no_face_priority,
+        "face_box": a.face_box,
+        "detail": a.detail,
+        "prep": resolved.get("prep"),
+        "sheet_tint": a.sheet_tint,
+    }
+    meta = {
+        "version": PREVIEW_JOB_VERSION,
+        "argv": argv,
+        "wall_width_ft": a.wall_width_ft,
+        "wall_height_ft": a.wall_height_ft,
+        "colors": int(len(palette)),
+        "min_region_in": a.min_region_in,
+        "detail": a.detail,
+        "prep": resolved.get("prep"),
+        "crop_box": list(crop_box),
+        "ppi": resolved["ppi"],
+        "fit_note": resolved["fit_note"],
+        "face_priority": {k: v for k, v in face.items() if k not in ("mask", "eye_mask")},
+        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask),
+    }
+    (out / PREVIEW_JOB_NAME).write_text(json.dumps(meta, indent=2) + "\n")
+    npz = {k: arr for k, arr in (
+        ("labels", labels),
+        ("regions", regions),
+        ("palette", palette),
+    ) if arr is not None}
+    if face_mask is not None:
+        npz["face_mask"] = face_mask.astype(np.float32)
+    if eye_mask is not None:
+        npz["eye_mask"] = eye_mask.astype(np.float32)
+    np.savez_compressed(out / LABELS_ARCHIVE, **npz)
+
+
+def load_saved_labels(from_dir):
+    path = from_dir / LABELS_ARCHIVE
+    if not path.is_file():
+        raise SystemExit(f"missing {LABELS_ARCHIVE} in {from_dir}")
+    data = np.load(path)
+    labels = data["labels"]
+    palette = data["palette"]
+    regions = data["regions"]
+    face_mask = data["face_mask"] if "face_mask" in data else None
+    eye_mask = data["eye_mask"] if "eye_mask" in data else None
+    return labels, palette, regions, face_mask, eye_mask
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--image", required=True, type=Path)
-    p.add_argument("--wall-width-ft", required=True, type=float)
-    p.add_argument("--wall-height-ft", required=True, type=float)
-    p.add_argument("--colors", required=True, type=int, help="number of paint colors (6-12 is easiest for groups)")
+    p.add_argument("--image", type=Path, help="source picture (required unless --from-preview)")
+    p.add_argument("--from-preview", type=Path,
+                   help="build the full kit from a prior --preview-only directory (preview_job.json + labels.npz)")
+    p.add_argument("--wall-width-ft", type=float, help="wall size (from preview job when --from-preview)")
+    p.add_argument("--wall-height-ft", type=float)
+    p.add_argument("--colors", type=int, help="paint colors; set automatically with --detail")
+    p.add_argument("--detail", choices=sorted(DETAIL_LEVELS),
+                   help="skill detail level (sets --colors and --min-region-in when not passed)")
+    p.add_argument("--prep", choices=("auto", "none", "soften", "balance", "sharpen"), default="auto",
+                   help="source image prep before tiling (auto follows --detail)")
     p.add_argument("--coats", type=int, choices=(1, 2), default=2, help="recorded for paint_math.py and shown on the cover")
     p.add_argument("--coverage-sqft-per-gal", type=float, default=375.0, help="recorded for paint_math.py")
     p.add_argument("--overlap-in", type=float, default=0.5, help="overlap between neighboring sheets, paper inches")
-    p.add_argument("--min-region-in", type=float, default=3.0,
+    p.add_argument("--min-region-in", type=float,
                    help="wall inches; regions smaller than this squared, or thinner than half of it, are merged away")
+    p.add_argument("--sheet-tint", type=float, default=0.0,
+                   help="0..0.35 light palette fill under sheet outlines so sheets match preview")
     p.add_argument("--transfer", choices=sorted(STYLES), default="trace")
     p.add_argument("--brand", default="", help="paint brand name, used for labels only")
     p.add_argument("--palette-json", type=Path, help="brand matches keyed by color number (see brand_match.py)")
@@ -115,10 +293,23 @@ def parse_args():
     p.add_argument("--face-box", default="",
                    help="manual face box in source pixels (after EXIF transpose): x0,y0,x1,y1")
     a = p.parse_args()
-    if a.colors < 2:
-        p.error("--colors must be at least 2")
+    a._from_preview_dir = None
+    if a.from_preview:
+        merge_from_preview_args(a, p)
+    else:
+        if not a.image:
+            p.error("--image required unless --from-preview")
+        if a.wall_width_ft is None or a.wall_height_ft is None:
+            p.error("--wall-width-ft and --wall-height-ft are required")
+        apply_detail_and_prep_defaults(a)
+    if a.colors is None or a.colors < 2:
+        p.error("need --colors or --detail (at least 2 colors)")
+    if a.min_region_in is None:
+        a.min_region_in = 3.0
     if min(a.wall_width_ft, a.wall_height_ft, a.scale, a.min_region_in, a.coverage_sqft_per_gal) <= 0:
         p.error("sizes, --scale, --min-region-in and coverage must be positive")
+    if not 0 <= a.sheet_tint <= 0.35:
+        p.error("--sheet-tint must be between 0 and 0.35")
     if not 0 <= a.overlap_in < 2:
         p.error("--overlap-in must be between 0 and 2 inches")
     if a.preview_sheets < 0:
@@ -854,6 +1045,39 @@ def place_numbers(crop, crop_regions, px_to_pt, style):
     return placed, labeled
 
 
+def complete_priority_labels(placed, labeled, crop, crop_regions, px_to_pt, style, masks):
+    """Every region touching a priority mask (face/eye) gets a number on the sheet."""
+    if not masks:
+        return placed, labeled
+    dist = interior_distance(crop)
+    covered = np.zeros(crop.shape, dtype=bool)
+    for m in masks:
+        if m is not None:
+            covered |= m >= 0.35
+    if not np.any(covered):
+        return placed, labeled
+    placed = list(placed)
+    labeled = set(labeled)
+    for rid in np.unique(crop_regions[covered]):
+        rid = int(rid)
+        if rid in labeled or rid <= 0:
+            continue
+        m = crop_regions == rid
+        if not np.any(m & covered):
+            continue
+        k = int(crop[m][0])
+        text = str(k + 1)
+        half_diag = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
+        sub = np.where(m, dist, 0)
+        cy, cx = np.unravel_index(sub.argmax(), sub.shape)
+        radius = float(dist[cy, cx])
+        raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else style.min_pt
+        size = min(style.max_pt, max(4.5, raw))
+        placed.append((cx + 0.5, cy + 0.5, text, size))
+        labeled.add(rid)
+    return placed, labeled
+
+
 # ---------- PDF pages ----------
 
 def text_color_for(rgb):
@@ -1142,7 +1366,8 @@ def neighbor_tag(cv, x, y, text, direction):
         cv.drawString(x + 6, y - 2.5, text)
 
 
-def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions, palette, style):
+def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions, palette, style,
+               face_mask=None, eye_mask=None):
     page = (layout.page_w * PT, layout.page_h * PT)
     cv.setPageSize(page)
     k = job["scale"] / job["ppi"]                 # paper inches per work pixel
@@ -1179,13 +1404,27 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     cv.setFont("Helvetica-Bold", 40)
     cv.drawString(left + ov + 6, top - ov - 42, sid)
 
+    wx0, wy0 = sx0 / k, sy0 / k
+    wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
+    tint = float(job.get("sheet_tint", 0))
+    if tint > 0:
+        x0i = max(0, int(math.floor(wx0)))
+        y0i = max(0, int(math.floor(wy0)))
+        x1i = min(labels.shape[1], int(math.ceil(wx1)))
+        y1i = min(labels.shape[0], int(math.ceil(wy1)))
+        if x1i > x0i and y1i > y0i:
+            tile = palette[labels[y0i:y1i, x0i:x1i]]
+            faded = np.clip(255.0 * (1 - tint) + tile.astype(np.float64) * tint, 0, 255).astype(np.uint8)
+            buf = BytesIO()
+            Image.fromarray(faded).save(buf, format="PNG")
+            buf.seek(0)
+            cv.drawImage(ImageReader(buf), left, bottom, cw, ch, preserveAspectRatio=False, anchor="sw")
+
     # Region outlines (vector), clipped to the tile.
     cv.saveState()
     clip = cv.beginPath()
     clip.rect(left, bottom, cw, ch)
     cv.clipPath(clip, stroke=0, fill=0)
-    wx0, wy0 = sx0 / k, sy0 / k
-    wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
     hit = np.nonzero((boxes[:, 2] >= wx0) & (boxes[:, 0] <= wx1) & (boxes[:, 3] >= wy0) & (boxes[:, 1] <= wy1))[0]
     path = cv.beginPath()
     for i in hit:
@@ -1210,7 +1449,15 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     crop = labels[y0p:y1p, x0p:x1p]
     cell_x1 = x1p if c == layout.cols - 1 else int(math.ceil((sx0 + layout.step_x) / k))
     cell_y1 = y1p if r == layout.rows - 1 else int(math.ceil((sy0 + layout.step_y) / k))
-    placed, labeled = place_numbers(labels[y0p:cell_y1, x0p:cell_x1], regions[y0p:cell_y1, x0p:cell_x1], k * PT, style)
+    cell_labels = labels[y0p:cell_y1, x0p:cell_x1]
+    cell_regions = regions[y0p:cell_y1, x0p:cell_x1]
+    placed, labeled = place_numbers(cell_labels, cell_regions, k * PT, style)
+    masks = []
+    if face_mask is not None:
+        masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
+    if eye_mask is not None:
+        masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
+    placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, k * PT, style, masks)
     cv.setFillColor(HexColor("#000000"))
     for x, y, text, size in placed:
         px, py = to_page(x + x0p, y + y0p)
@@ -1324,18 +1571,28 @@ def _region_count_on_sheet(layout, r, c, k, regions):
     return len(np.unique(crop[crop > 0]))
 
 
-def _best_face_sheet(layout, face, k):
-    work_boxes = [tuple(f["work_box"]) for f in face.get("faces", []) if f.get("work_box")]
-    if not work_boxes:
+def _face_mask_on_sheet(layout, r, c, k, face_mask):
+    if face_mask is None:
+        return 0.0
+    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+    h, w = face_mask.shape
+    x0, y0 = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+    x1, y1 = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float(face_mask[y0:y1, x0:x1].sum())
+
+
+def _best_face_sheet(layout, face_mask, k, min_weight=1.0):
+    if face_mask is None or float(face_mask.max()) < 0.1:
         return None
     best = (-1.0, 0, 0)
     for r in range(layout.rows):
         for c in range(layout.cols):
-            wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
-            area = sum(_rect_intersection_area(*box, wx0, wy0, wx1, wy1) for box in work_boxes)
+            area = _face_mask_on_sheet(layout, r, c, k, face_mask)
             if area > best[0]:
                 best = (area, r, c)
-    if best[0] <= 0:
+    if best[0] < min_weight:
         return None
     return best[1], best[2], best[0]
 
@@ -1350,7 +1607,7 @@ def _best_region_sheet(layout, k, regions):
     return best[1], best[2], best[0]
 
 
-def pick_preview_sheets(preview_sheets, layout, regions, face, k):
+def pick_preview_sheets(preview_sheets, layout, regions, face, k, face_mask=None):
     """Return [(r, c, reason), ...] in render order, at most preview_sheets entries."""
     if preview_sheets <= 0:
         return []
@@ -1363,10 +1620,10 @@ def pick_preview_sheets(preview_sheets, layout, regions, face, k):
         seen.add((r, c))
         picks.append((r, c, reason))
 
-    face_pick = _best_face_sheet(layout, face, k) if face.get("found") else None
+    face_pick = _best_face_sheet(layout, face_mask, k) if face.get("found") else None
     if face_pick:
         r, c, area = face_pick
-        add(r, c, f"most face area on sheet ({area:.0f} work px²)")
+        add(r, c, f"most face-mask weight on sheet ({area:.1f})")
     else:
         r, c, n = _best_region_sheet(layout, k, regions)
         add(r, c, f"most regions ({n})")
@@ -1389,7 +1646,8 @@ def pick_preview_sheets(preview_sheets, layout, regions, face, k):
 
 
 def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
-                          chunks, boxes, labels, regions, style, sample_sheets):
+                          chunks, boxes, labels, regions, palette_arr, style, sample_sheets,
+                          face_mask=None, eye_mask=None):
     cv = Canvas(str(path), pagesize=letter, invariant=1, pageCompression=1)
     cv.setTitle("Paint-by-number mural (preview)")
     cover_pages, key_on_cover = draw_cover(cv, job, small, palette, areas, brand_map, layout)
@@ -1398,7 +1656,7 @@ def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, m
     draw_map(cv, job, small, layout, mural_w, mural_h)
     for r, c, _reason in sample_sheets:
         draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
-                   palette, style)
+                   palette_arr, style, face_mask=face_mask, eye_mask=eye_mask)
     cv.save()
     return cover_pages
 
@@ -1493,52 +1751,76 @@ def load_brand_map(path, n_colors):
 
 def main():
     a = parse_args()
+    if getattr(a, "_from_preview_dir", None):
+        a.preview_only = False
     wall_w_in, wall_h_in = a.wall_width_ft * 12, a.wall_height_ft * 12
-    ppi = min(TARGET_PPI, math.sqrt(MAX_WORK_PIXELS / (wall_w_in * wall_h_in)))
     style = STYLES[a.transfer]
+    resolved = {"detail": a.detail, "prep": a.prep}
+    crop_box = (0, 0, 0, 0)
 
-    src = ImageOps.exif_transpose(Image.open(a.image)).convert("RGB")
-    want_upscale = False
-    if not a.no_face_priority and (a.face_box or _detect_faces_yunet(src)):
-        want_upscale = True
-    ppi = _maybe_upscale_ppi(src, wall_w_in, wall_h_in, ppi, enabled=want_upscale)
-    img, fit_note, crop_box = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
-    rgb = np.asarray(img)
-    face = resolve_faces(src, img, crop_box, a)
-    if face["mask"] is not None:
-        labels = quantize_face_priority(
-            img, a.colors, ppi, face["mask"],
-            eye_mask=face.get("eye_mask"), n_eye=face.get("eye_colors_reserved") or 0,
-        )
-        face_min = face["face_min_region_in"]
-        eye_min = face.get("eye_min_region_in")
-        win_bg = int(round(a.min_region_in / 4 * ppi)) | 1
-        win_face = int(round(face_min / 4 * ppi)) | 1
-        labels = majority_filter_face_aware(
-            labels, a.colors, win_bg, win_face, face["mask"], eye_mask=face.get("eye_mask"),
-        )
-        eye_kwargs = {}
-        if eye_min:
-            eye_kwargs = {
-                "eye_mask": face["eye_mask"],
-                "eye_area_px": (eye_min * ppi) ** 2,
-                "eye_thick_px": eye_min / 2 * ppi,
-            }
-        labels = clean_regions_face_aware(
-            labels,
-            (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi,
-            (face_min * ppi) ** 2, face_min / 2 * ppi,
-            face["mask"],
-            **eye_kwargs,
-        )
+    if getattr(a, "_from_preview_dir", None):
+        meta = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text())
+        labels, palette, regions, face_mask, eye_mask = load_saved_labels(a._from_preview_dir)
+        _, region_colors = label_regions(labels)
+        ppi = float(meta["ppi"])
+        fit_note = meta["fit_note"]
+        crop_box = tuple(meta["crop_box"])
+        face = dict(meta["face_priority"])
+        face["mask"] = face_mask
+        face["eye_mask"] = eye_mask
+        resolved.update({"ppi": ppi, "fit_note": fit_note, "detail": meta.get("detail"), "prep": meta.get("prep")})
+        print(f"from-preview: loaded {LABELS_ARCHIVE} from {a._from_preview_dir} "
+              f"({labels.shape[1]}x{labels.shape[0]} work px, {int(regions.max())} regions)")
     else:
-        labels = quantize(img, a.colors, ppi)
-        window = int(round(a.min_region_in / 4 * ppi)) | 1
-        labels = majority_filter(labels, a.colors, window)
-        labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
-    labels, palette = finalize_palette(labels, rgb)
-    regions, region_colors = label_regions(labels)
+        src = ImageOps.exif_transpose(Image.open(a.image)).convert("RGB")
+        src = apply_image_prep(src, a.prep)
+        resolved["prep"] = a.prep
+        want_upscale = False
+        if not a.no_face_priority and (a.face_box or _detect_faces_yunet(src)):
+            want_upscale = True
+        ppi = min(TARGET_PPI, math.sqrt(MAX_WORK_PIXELS / (wall_w_in * wall_h_in)))
+        ppi = _maybe_upscale_ppi(src, wall_w_in, wall_h_in, ppi, enabled=want_upscale)
+        resolved["ppi"] = ppi
+        img, fit_note, crop_box = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
+        resolved["fit_note"] = fit_note
+        rgb = np.asarray(img)
+        face = resolve_faces(src, img, crop_box, a)
+        if face["mask"] is not None:
+            labels = quantize_face_priority(
+                img, a.colors, ppi, face["mask"],
+                eye_mask=face.get("eye_mask"), n_eye=face.get("eye_colors_reserved") or 0,
+            )
+            face_min = face["face_min_region_in"]
+            eye_min = face.get("eye_min_region_in")
+            win_bg = int(round(a.min_region_in / 4 * ppi)) | 1
+            win_face = int(round(face_min / 4 * ppi)) | 1
+            labels = majority_filter_face_aware(
+                labels, a.colors, win_bg, win_face, face["mask"], eye_mask=face.get("eye_mask"),
+            )
+            eye_kwargs = {}
+            if eye_min:
+                eye_kwargs = {
+                    "eye_mask": face["eye_mask"],
+                    "eye_area_px": (eye_min * ppi) ** 2,
+                    "eye_thick_px": eye_min / 2 * ppi,
+                }
+            labels = clean_regions_face_aware(
+                labels,
+                (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi,
+                (face_min * ppi) ** 2, face_min / 2 * ppi,
+                face["mask"],
+                **eye_kwargs,
+            )
+        else:
+            labels = quantize(img, a.colors, ppi)
+            window = int(round(a.min_region_in / 4 * ppi)) | 1
+            labels = majority_filter(labels, a.colors, window)
+            labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
+        labels, palette = finalize_palette(labels, rgb)
+        regions, region_colors = label_regions(labels)
     n = len(palette)
+    face_mask = face.get("mask")
+    eye_mask = face.get("eye_mask")
 
     wall_sqft = wall_w_in * wall_h_in / 144
     counts = np.bincount(labels.ravel(), minlength=n)
@@ -1556,7 +1838,8 @@ def main():
     layout = choose_layout(mural_w, mural_h, a.overlap_in)
     job = {"wall_w_in": wall_w_in, "wall_h_in": wall_h_in, "wall_sqft": wall_sqft, "coats": a.coats,
            "transfer": a.transfer, "brand": a.brand, "overlap": a.overlap_in, "scale": a.scale, "ppi": ppi,
-           "fit_note": fit_note}
+           "fit_note": fit_note, "sheet_tint": a.sheet_tint, "detail": a.detail}
+    sigma = trace_sigma(ppi, a.min_region_in, face)
 
     a.out.mkdir(parents=True, exist_ok=True)
     preview = Image.fromarray(palette[labels])
@@ -1571,21 +1854,26 @@ def main():
     draw_map(cv, job, small, layout, mural_w, mural_h)
     front_pages = cover_pages + key_pages + 1  # cover + optional key pages + placement map
     labeled = set()
-    chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=max(2.0, 0.1 * ppi)))
+    chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=sigma))
+    f_mask, e_mask = face_mask, eye_mask
     if not a.preview_only:
         for r in range(layout.rows):
             for c in range(layout.cols):
                 labeled |= draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
-                                      palette, style)
+                                      palette, style, face_mask=f_mask, eye_mask=e_mask)
     cv.save()
 
     preview_samples = []
     if a.preview_only:
+        save_preview_job(a.out, a, resolved, face, labels, palette, regions, crop_box, face_mask, eye_mask)
+        print(f"preview job: {a.out / PREVIEW_JOB_NAME}")
+        print(f"preview job: {a.out / LABELS_ARCHIVE}")
         k_sheet = job["scale"] / job["ppi"]
-        preview_samples = pick_preview_sheets(a.preview_sheets, layout, regions, face, k_sheet)
+        preview_samples = pick_preview_sheets(a.preview_sheets, layout, regions, face, k_sheet, face_mask)
         kit_pdf = a.out / "preview_kit.pdf"
         build_preview_kit_pdf(kit_pdf, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
-                              chunks, boxes, labels, regions, style, preview_samples)
+                              chunks, boxes, labels, regions, palette, style, preview_samples,
+                              face_mask=f_mask, eye_mask=e_mask)
         outlined = a.out / "preview_outlined.png"
         draw_preview_outlined(outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style)
         pages_dir = a.out / "preview_pages"
@@ -1605,6 +1893,8 @@ def main():
         "coats": a.coats, "coverage_sqft_per_gal": a.coverage_sqft_per_gal, "brand": a.brand,
         "requested_colors": a.colors, "colors_used": n, "transfer": a.transfer, "scale": a.scale,
         "fit": fit_note, "work_px_per_wall_in": round(ppi, 2), "min_region_in": a.min_region_in,
+        "detail": a.detail, "prep": resolved.get("prep"), "trace_sigma": round(sigma, 3),
+        "label_metrics": label_metrics(labels, regions, face_mask, eye_mask),
         "sheets": {"count": layout.count, "rows": layout.rows, "cols": layout.cols,
                    "orientation": "landscape" if layout.landscape else "portrait", "overlap_in": a.overlap_in},
         "regions": int(regions.max()),
@@ -1626,6 +1916,13 @@ def main():
     }
     if not a.preview_only:
         summary["unlabeled_regions"] = int(regions.max()) - len(labeled)
+        if getattr(a, "_from_preview_dir", None):
+            saved_lm = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text()).get("label_metrics", {})
+            live = summary["label_metrics"]
+            summary["label_parity"] = {
+                "regions_match": saved_lm.get("regions") == live["regions"],
+                "face_regions_match": saved_lm.get("face_regions") == live.get("face_regions"),
+            }
     (a.out / "paint_areas.json").write_text(json.dumps(summary, indent=2) + "\n")
     pdf_mb = (a.out / "mural.pdf").stat().st_size / 1e6
     sheet_note = f"{layout.count} sheets" if a.preview_only else f"{summary['sheets']['count']} sheets"

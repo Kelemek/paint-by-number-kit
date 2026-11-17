@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Compare preview vs full-build parity across skill detail levels."""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+IMG = ROOT / "test_assets" / "preview_face.png"
+FACE = "120,80,360,480"
+
+
+def run(cmd):
+    subprocess.run(cmd, check=True, cwd=ROOT)
+
+
+def metrics(job_dir, preview_dir=None):
+    areas = json.loads((job_dir / "paint_areas.json").read_text())
+    preview_dir = preview_dir or job_dir
+    prev = json.loads((preview_dir / "preview_job.json").read_text())
+    return {
+        "regions": areas["regions"],
+        "preview_regions": prev["label_metrics"]["regions"],
+        "detail": areas.get("detail"),
+        "unlabeled": areas.get("unlabeled_regions"),
+        "face_regions": areas.get("label_metrics", {}).get("face_regions"),
+        "parity": areas.get("label_parity"),
+        "trace_sigma": areas.get("trace_sigma"),
+    }
+
+
+def main():
+    if not IMG.is_file():
+        print(f"missing {IMG}", file=sys.stderr)
+        return 1
+    levels = ["low", "medium", "high", "photo"]
+    sizes = [("wall", 8, 6), ("canvas", 2, 1.5)]
+    print("level,size,preview_regions,full_regions,unlabeled,face_regions,parity,trace_sigma")
+    for level in levels:
+        for name, w, h in sizes:
+            base = Path(f"/tmp/parity_{name}_{level}")
+            base.mkdir(parents=True, exist_ok=True)
+            run([
+                "python3", "mural_tiler.py",
+                "--image", str(IMG), "--face-box", FACE,
+                "--wall-width-ft", str(w), "--wall-height-ft", str(h),
+                "--detail", level, "--preview-only", "--out", str(base),
+            ])
+            run(["python3", "mural_tiler.py", "--from-preview", str(base), "--out", str(base / "full")])
+            prev = metrics(base)
+            full = metrics(base / "full", base)
+            ok = full["parity"] and full["parity"].get("regions_match")
+            print(
+                f"{level},{name},{prev['regions']},{full['regions']},{full['unlabeled']},"
+                f"{full['face_regions']},{ok},{full['trace_sigma']}"
+            )
+            # Manual mismatch probe: rerun without detail/prep/face-box (simulates organizer typo)
+            mismatch = Path(f"/tmp/parity_{name}_{level}_mismatch")
+            mismatch.mkdir(parents=True, exist_ok=True)
+            run([
+                "python3", "mural_tiler.py",
+                "--image", str(IMG),
+                "--wall-width-ft", str(w), "--wall-height-ft", str(h),
+                "--colors", "8", "--no-face-priority",
+                "--out", str(mismatch),
+            ])
+            bad = json.loads((mismatch / "paint_areas.json").read_text())["regions"]
+            print(f"  mismatch_rerun_regions={bad} (preview had {prev['regions']})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

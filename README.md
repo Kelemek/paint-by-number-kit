@@ -19,7 +19,7 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## Files
 
-- `mural_tiler.py` reduces the picture to N colors, numbers the regions, tiles it into sheets, and builds the kit PDF. Face and eye priority are on by default. `--preview-only` also writes `preview_kit.pdf` (cover, map, and sample sheets drawn like the full build), `preview_outlined.png`, and rasterized `preview_pages/` when `pdftoppm` is available.
+- `mural_tiler.py` reduces the picture to N colors, numbers the regions, tiles it into sheets, and builds the kit PDF. Face and eye priority are on by default. Use `--detail low|medium|high|photo` for skill-aligned colors and min-region sizing; `--prep` applies the matching source prep in-process. `--preview-only` saves `preview_job.json` + `labels.npz`; rebuild the exact same label map with `--from-preview DIR`. Rich preview assets include `preview_kit.pdf`, `preview_outlined.png`, and rasterized `preview_pages/` when `pdftoppm` is available.
 - `brand_match.py` matches each kit color to the nearest color in a brand palette JSON (always approximate; check paint chips).
 - `paint_math.py` turns each color's area into a shopping list with can sizes and merges it into the kit.
 - `example_brand_palette.json` shows the palette format.

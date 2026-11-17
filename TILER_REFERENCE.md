@@ -65,6 +65,10 @@ inputs. The tiler rejects a palette map whose numbers don't fit the run.
 | `--brand` | none | brand name for labels only |
 | `--palette-json` | none | output of `brand_match.py`: `{"1": {"name", "code", "hex", "delta_e"}}` |
 | `--scale` | 1.0 | print scale. 1.0 = sheets are true wall size (tracing templates). Below 1 gives a smaller reference set, flagged in red on the cover and on every sheet |
+| `--detail low\|medium\|high\|photo` | none | skill level: sets `--colors` and `--min-region-in` (wall inches or canvas % of short side) when omitted |
+| `--prep auto\|none\|soften\|balance\|sharpen` | auto | source prep before crop (auto follows `--detail`) |
+| `--from-preview` | none | build from saved `preview_job.json` + `labels.npz` (exact preview parity) |
+| `--sheet-tint` | 0 | 0–0.35 light palette fill under sheet outlines |
 | `--preview-only` | off | skip full `mural.pdf` sheets; write rich preview artifacts (see below) |
 | `--preview-sheets` | 2 | with `--preview-only`, how many sample letter sheets go in `preview_kit.pdf` (0 = map and outlined image only) |
 | `--out` | required | output directory |
@@ -79,7 +83,9 @@ inputs. The tiler rejects a palette map whose numbers don't fit the run.
 | `preview_outlined.png` | Whole mural at wall proportions with region outlines, numbers, faint sheet grid, and sheet IDs |
 | `preview_pages/page-N.png` | Rasterized `preview_kit.pdf` pages when `pdftoppm` (poppler-utils) is installed |
 
-Sample sheets are chosen automatically: the sheet with the most face area when a face is detected (otherwise the sheet with the most regions), plus the top-left sheet; extra slots fill by region count. The log lists each sample sheet ID, why it was picked, and the sheet count the full build will use.
+Sample sheets are chosen automatically: the sheet with the most face-mask weight when a face is detected (otherwise the sheet with the most regions), plus the top-left sheet; extra slots fill by region count. The log lists each sample sheet ID, why it was picked, and the sheet count the full build will use.
+
+`--preview-only` also writes `preview_job.json` (resolved args, crop, face metadata, label metrics) and `labels.npz` (final label map, palette, regions, face/eye masks). Run the full kit with `mural_tiler.py --from-preview job --out job` (or another `--out`) so the PDF uses the saved labels, not a manual rerun.
 
 ### paint_math.py flags
 
