@@ -97,7 +97,7 @@ def main():
             )
 
         grid_rows = []
-        for level in LEVELS:
+        for level in DETAIL_LEVELS:
             wall = after_root / f"{slug}_{level}_wall"
             if not (wall / PREVIEW_JOB_NAME).is_file():
                 continue

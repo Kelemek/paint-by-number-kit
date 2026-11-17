@@ -49,8 +49,9 @@ def run_preview(out: Path, level: str, w: float, h: float):
     subprocess.run(cmd, check=True, cwd=ROOT)
 
 
-def work_rgb_and_masks(meta, prep):
-    src = ImageOps.exif_transpose(Image.open(IMG)).convert("RGB")
+def work_rgb_and_masks(meta, prep, image_path=None):
+    src_path = Path(image_path) if image_path else IMG
+    src = ImageOps.exif_transpose(Image.open(src_path)).convert("RGB")
     src = apply_image_prep(src, prep)
     wall_w_in, wall_h_in = meta["wall_width_ft"] * 12, meta["wall_height_ft"] * 12
     ppi = float(meta["ppi"])
@@ -125,7 +126,8 @@ def crop_box(arr, box):
 def analyze_dir(job_dir: Path, tag: str):
     meta = json.loads((job_dir / PREVIEW_JOB_NAME).read_text())
     prep = meta.get("prep") or "auto"
-    rgb, face = work_rgb_and_masks(meta, prep)
+    img_path = Path(meta.get("argv", {}).get("image") or IMG)
+    rgb, face = work_rgb_and_masks(meta, prep, img_path)
     data = np.load(job_dir / LABELS_ARCHIVE)
     labels = data["labels"]
     palette = data["palette"]
