@@ -20,7 +20,7 @@ Drop `--break-system-packages` on systems without PEP 668 (or use a venv).
 
 | File | What it does |
 |---|---|
-| `mural_tiler.py` | picture → `mural.pdf` (cover, placement map, sheets), `paint_areas.json`, `preview.png` |
+| `mural_tiler.py` | picture → `mural.pdf` (cover, placement map, sheets), `paint_areas.json`, `preview.png`; with `--preview-only` also `preview_kit.pdf`, `preview_outlined.png`, `preview_pages/` |
 | `brand_match.py` | nearest brand color per mural color (CIEDE2000) → palette map for `--palette-json` |
 | `paint_math.py` | `paint_areas.json` → shopping list (`.md`, `.csv`, `.pdf`), optionally merged into the kit PDF |
 | `example_brand_palette.json` | **example data** showing the brand palette format (made-up names and codes) |
@@ -32,8 +32,9 @@ Drop `--break-system-packages` on systems without PEP 668 (or use a venv).
 ```bash
 ARGS=(--image photo.jpg --wall-width-ft 10 --wall-height-ft 8 --colors 8 --coats 2 --transfer trace --brand "Behr")
 
-# 1. Quick preview (cover + map + areas, no sheets) to show the organizer.
-python3 mural_tiler.py "${ARGS[@]}" --preview-only --out job
+# 1. Quick preview (cover + map + areas + sample sheets) to show the organizer.
+python3 mural_tiler.py "${ARGS[@]}" --preview-only --preview-sheets 2 --out job
+# job/preview_kit.pdf, preview_outlined.png, preview_pages/page-*.png, preview.png
 
 # 2. Match colors to the chosen brand (palette built from that brand's published color list; see below).
 python3 brand_match.py --areas job/paint_areas.json --palette behr_palette.json --out job/palette_map.json
@@ -64,8 +65,27 @@ inputs. The tiler rejects a palette map whose numbers don't fit the run.
 | `--brand` | none | brand name for labels only |
 | `--palette-json` | none | output of `brand_match.py`: `{"1": {"name", "code", "hex", "delta_e"}}` |
 | `--scale` | 1.0 | print scale. 1.0 = sheets are true wall size (tracing templates). Below 1 gives a smaller reference set, flagged in red on the cover and on every sheet |
-| `--preview-only` | off | skip the sheets |
+| `--detail low\|medium\|high\|photo` | none | skill level: sets `--colors` and `--min-region-in` (wall inches or canvas % of short side) when omitted |
+| `--prep auto\|none\|soften\|balance\|sharpen` | auto | source prep before crop (auto follows `--detail`) |
+| `--from-preview` | none | build from saved `preview_job.json` + `labels.npz` (exact preview parity) |
+| `--sheet-tint` | 0 | 0–0.35 light palette fill under sheet outlines |
+| `--preview-only` | off | skip full `mural.pdf` sheets; write rich preview artifacts (see below) |
+| `--preview-sheets` | 2 | with `--preview-only`, how many sample letter sheets go in `preview_kit.pdf` (0 = map and outlined image only) |
 | `--out` | required | output directory |
+
+### Preview-only outputs
+
+`--preview-only` always writes `mural.pdf` (cover + placement map only), `paint_areas.json`, and `preview.png` (plain color-reduced image). It also writes:
+
+| File | Contents |
+|---|---|
+| `preview_kit.pdf` | Cover, placement map, and `--preview-sheets` sample sheets using the same `draw_sheet` code as the full build |
+| `preview_outlined.png` | Whole mural at wall proportions with region outlines, numbers, faint sheet grid, and sheet IDs |
+| `preview_pages/page-N.png` | Rasterized `preview_kit.pdf` pages when `pdftoppm` (poppler-utils) is installed |
+
+Sample sheets are chosen automatically: the sheet with the most face-mask weight when a face is detected (otherwise the sheet with the most regions), plus the top-left sheet; extra slots fill by region count. The log lists each sample sheet ID, why it was picked, and the sheet count the full build will use.
+
+`--preview-only` also writes `preview_job.json` (resolved args, crop, face metadata, label metrics) and `labels.npz` (final label map, palette, regions, face/eye masks). Run the full kit with `mural_tiler.py --from-preview job --out job` (or another `--out`) so the PDF uses the saved labels, not a manual rerun.
 
 ### paint_math.py flags
 
