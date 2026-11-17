@@ -15,7 +15,9 @@ sys.path.insert(0, str(ROOT))
 from mural_tiler import (  # noqa: E402
     LABELS_ARCHIVE,
     PREVIEW_JOB_NAME,
+    STYLES,
     apply_image_prep,
+    audit_sheet_legibility,
     choose_layout,
     fit_to_wall,
     render_focal_sheet_crop,
@@ -207,7 +209,31 @@ def check_l_tolerance(orig_stats, prev_stats, tol=L_TOLERANCE):
     return abs(err) <= tol, err
 
 
-def audit_job(job_dir: Path, check_sheet_crop=False):
+def audit_legibility(job_dir: Path, transfer="trace"):
+    """Check simulated sheet numbers for size, overlap, and boundary clearance."""
+    job_dir = Path(job_dir)
+    preview_dir = job_dir if (job_dir / PREVIEW_JOB_NAME).is_file() else job_dir.parent
+    meta, rgb, prev, labels, palette, face_mask, eye_mask, mouth_mask, scale, w_in, h_in = load_context(preview_dir)
+    full = preview_dir / "full"
+    areas_path = full / "paint_areas.json" if (full / "paint_areas.json").is_file() else preview_dir / "paint_areas.json"
+    if not areas_path.is_file():
+        return ["missing paint_areas.json for legibility audit"]
+    areas = json.loads(areas_path.read_text())
+    transfer = areas.get("transfer") or meta.get("argv", {}).get("transfer") or transfer
+    style = STYLES.get(transfer, STYLES["trace"])
+    overlap = float(meta.get("argv", {}).get("overlap_in") or 0.5)
+    layout = choose_layout(w_in * scale, h_in * scale, overlap)
+    job = {"scale": scale, "ppi": float(meta["ppi"])}
+    data = np.load(preview_dir / LABELS_ARCHIVE)
+    regions = data["regions"] if "regions" in data else None
+    if regions is None:
+        from mural_tiler import label_regions
+
+        _, regions = label_regions(labels)
+    return audit_sheet_legibility(labels, regions, layout, job, style, face_mask, eye_mask, mouth_mask)
+
+
+def audit_job(job_dir: Path, check_sheet_crop=False, check_legibility=False):
     meta, rgb, prev, labels, palette, face_mask, eye_mask, mouth_mask, scale, w_in, h_in = load_context(job_dir)
     eye_o = _zone_l(rgb, eye_mask)
     mouth_o = _zone_l(rgb, mouth_mask)
@@ -264,6 +290,8 @@ def audit_job(job_dir: Path, check_sheet_crop=False):
                 job_dir, layout, job, box, eye_mask, mouth_mask, face_mask, mural_w=mural_w, mural_h=mural_h,
             )
             failures.extend(check_focal_sheet_crop(crop, eye_mask, box, mouth_mask, labels))
+    if check_legibility:
+        failures.extend(audit_legibility(job_dir))
     return failures
 
 

@@ -21,6 +21,7 @@ With --preview-only also writes:
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ from scipy import ndimage
 from sklearn.cluster import KMeans
 
 PT = 72.0                 # PDF points per inch
+PRINT_ABS_MIN_PT = 6.0    # numbers on sheets must not render below this (6 pt hard floor)
 MARGIN = 0.25             # printer-safe page margin, inches
 HEADER, FOOTER = 0.25, 0.45
 TARGET_PPI = 24           # work pixels per wall inch
@@ -245,6 +247,10 @@ def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box,
         "detail": a.detail,
         "prep": resolved.get("prep"),
         "sheet_tint": a.sheet_tint,
+        "merge_guide_specks": a.merge_guide_specks,
+        "min_guide_region_in": a.min_guide_region_in,
+        "detail_inset": a.detail_inset,
+        "soup_report": a.soup_report,
     }
     meta = {
         "version": PREVIEW_JOB_VERSION,
@@ -262,6 +268,12 @@ def save_preview_job(out, a, resolved, face, labels, palette, regions, crop_box,
         "face_priority": _subject_meta_for_json(face),
         "label_metrics": label_metrics(labels, regions, face_mask, eye_mask, mouth_mask),
     }
+    if getattr(a, "placement_meta", None):
+        meta["placement"] = a.placement_meta
+    if getattr(a, "detail_insets_resolved", None):
+        meta["detail_insets"] = a.detail_insets_resolved
+    if getattr(a, "soup_clumps", None):
+        meta["soup_clumps"] = a.soup_clumps
     (out / PREVIEW_JOB_NAME).write_text(json.dumps(meta, indent=2) + "\n")
     npz = {k: arr for k, arr in (
         ("labels", labels),
@@ -327,6 +339,28 @@ def parse_args():
                    help="manual subject box in source pixels (after EXIF): x0,y0,x1,y1")
     p.add_argument("--face-box", default="",
                    help="alias for --subject-box when the subject is a person")
+    p.add_argument(
+        "--merge-guide-specks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="merge outline specks smaller than --min-guide-region-in (default on)",
+    )
+    p.add_argument(
+        "--min-guide-region-in",
+        type=float,
+        default=None,
+        help="wall inches; smaller shapes merge away when --merge-guide-specks (default ~35%% of min-region)",
+    )
+    p.add_argument(
+        "--soup-report",
+        action="store_true",
+        help="write soup_report.json and soup crop PNGs for crowded focal clumps",
+    )
+    p.add_argument(
+        "--detail-inset",
+        default="",
+        help="add enlarged detail sheet(s): auto (from soup) or work-pixel box x0,y0,x1,y1",
+    )
     a = p.parse_args()
     if a.no_face_priority:
         a.no_subject_priority = True
@@ -635,8 +669,18 @@ def _animal_head_box(animal_box, class_name):
     return (x0, y0, x0 + bw, y0 + frac * bh)
 
 
+def _cat_head_box_geometric(animal_box):
+    """Upper-head crop when Haar is unavailable (e.g. OpenCV headless builds)."""
+    x0, y0, x1, y1 = animal_box
+    bw, bh = x1 - x0, y1 - y0
+    inset = 0.10 * bw
+    top = y0 + 0.06 * bh
+    bot = y0 + 0.68 * bh
+    return (x0 + inset, top, x1 - inset, bot)
+
+
 def _refine_cat_head_box(src, animal_box):
-    fallback = _animal_head_box(animal_box, "cat")
+    fallback = _cat_head_box_geometric(animal_box)
     if not CAT_FACE_CASCADE.is_file():
         return fallback, False
     try:
@@ -664,7 +708,8 @@ def _refine_cat_head_box(src, animal_box):
     return (cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2), True
 
 
-def _eye_disks_from_contrast(rgb_img, head_box, img_w, img_h):
+def _eye_disks_from_head_features(rgb_img, head_box, img_w, img_h):
+    """Locate each eye within the upper head using local color salience (not global darkest pixels)."""
     x0, y0, x1, y1 = (int(v) for v in head_box)
     x0, y0 = max(0, x0), max(0, y0)
     x1, y1 = min(img_w, x1), min(img_h, y1)
@@ -672,23 +717,38 @@ def _eye_disks_from_contrast(rgb_img, head_box, img_w, img_h):
         return []
     arr = np.asarray(rgb_img)[y0:y1, x0:x1]
     hh, ww = arr.shape[:2]
-    upper_h = max(4, int(hh * 0.55))
+    upper_h = max(4, int(hh * 0.52))
+    lab = rgb_to_lab(arr[:upper_h].reshape(-1, 3)).reshape(upper_h, ww, 3)
+    luma = lab[:, :, 0]
+    chroma = np.hypot(lab[:, :, 1], lab[:, :, 2])
     disks = []
     for x_lo, x_hi in ((0, ww // 2), (ww // 2, ww)):
-        patch = arr[:upper_h, x_lo:x_hi]
-        if patch.size < 40:
+        if x_hi - x_lo < 6:
             continue
-        lab = rgb_to_lab(patch.reshape(-1, 3))[:, 0].reshape(patch.shape[:2])
-        cut = np.percentile(lab, 12)
-        mask = lab <= cut + 2.0
-        if mask.sum() < 12:
+        lh = luma[:, x_lo:x_hi]
+        ch = chroma[:, x_lo:x_hi]
+        score = ch * np.exp(-0.5 * ((lh - 42.0) / 16.0) ** 2)
+        score *= (lh > 18) & (lh < 68)
+        if score.max() < 1e-6:
             continue
-        ys, xs = np.nonzero(mask)
-        cx = float(xs.mean() + x_lo + x0)
-        cy = float(ys.mean() + y0)
-        r = max(3.0, min(patch.shape[0], patch.shape[1]) * 0.14)
+        sm = ndimage.gaussian_filter(score, sigma=1.15)
+        peak = sm >= (sm.max() * 0.62)
+        if peak.sum() < 6:
+            py, px = np.unravel_index(int(sm.argmax()), sm.shape)
+        else:
+            py, px = np.nonzero(peak)
+            w = sm[peak]
+            py = float((py * w).sum() / w.sum())
+            px = float((px * w).sum() / w.sum())
+        cx = float(px + x_lo + x0)
+        cy = float(py + y0)
+        r = max(3.0, min(upper_h, x_hi - x_lo) * 0.13)
         disks.append((cx, cy, r))
     return disks
+
+
+def _eye_disks_from_contrast(rgb_img, head_box, img_w, img_h):
+    return _eye_disks_from_head_features(rgb_img, head_box, img_w, img_h)
 
 
 def _muzzle_ellipse_animal(head_box):
@@ -1244,8 +1304,6 @@ def clean_regions_face_aware(labels, min_area_px, min_thick_px, face_area_px, fa
         slices = ndimage.find_objects(regions)
         changed = False
         for rid in bad[np.argsort(area[bad - 1], kind="stable")]:
-            if eye_frac[rid - 1] > 0.55 or mouth_frac[rid - 1] > 0.55:
-                continue
             sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in slices[rid - 1])
             mask = regions[sl] == rid
             sub = labels[sl]
@@ -1380,6 +1438,296 @@ def interior_distance(labels):
     c = p[1:-1, 1:-1]
     edge = (c != p[:-2, 1:-1]) | (c != p[2:, 1:-1]) | (c != p[1:-1, :-2]) | (c != p[1:-1, 2:])
     return ndimage.distance_transform_edt(~edge)
+
+
+def _digit_half_diag(font_name):
+    return math.hypot(stringWidth("8", font_name, 1), 0.72) / 2
+
+
+def min_inscribed_radius_for_pt(style, px_to_pt, target_pt):
+    """Work-pixel inscribed radius needed to fit a centred number at target_pt (same math as place_numbers)."""
+    half = _digit_half_diag(style.font)
+    return target_pt * half / (0.85 * px_to_pt)
+
+
+def printable_region_limits(style, px_to_pt):
+    """Minimum connected-region area and thickness (work px) for legible numbers at print scale."""
+    r_target = min_inscribed_radius_for_pt(style, px_to_pt, style.min_pt)
+    r_abs = min_inscribed_radius_for_pt(style, px_to_pt, PRINT_ABS_MIN_PT)
+    r = max(r_target, r_abs)
+    area = (2 * r) ** 2 * 0.78
+    return area, 2 * r, r
+
+
+def default_min_guide_in(min_region_in):
+    return max(0.04, 0.35 * float(min_region_in))
+
+
+def region_inscribed_radius(rid, regions, dist):
+    m = regions == rid
+    if not np.any(m):
+        return 0.0
+    return float(dist[m].max())
+
+
+def classify_placement_regions(regions, labels, style, px_to_pt, ppi, min_guide_in, min_region_in=3.0):
+    """Split regions into numbered, freehand guide, or speck (optional merge)."""
+    dist = interior_distance(labels)
+    _, _, min_num_r = printable_region_limits(style, px_to_pt)
+    guide_in = min_guide_in if min_guide_in is not None else default_min_guide_in(min_region_in)
+    min_guide_px = max(3.0, guide_in * ppi)
+    min_guide_r = min_guide_px * 0.45
+    numbered, guide, speck = set(), set(), set()
+    for rid in range(1, int(regions.max()) + 1):
+        r = region_inscribed_radius(rid, regions, dist)
+        area = int((regions == rid).sum())
+        if r >= min_num_r * 0.88:
+            numbered.add(rid)
+        elif r >= min_guide_r or area >= min_guide_px * min_guide_px * 0.35:
+            guide.add(rid)
+        else:
+            speck.add(rid)
+    return numbered, guide, speck
+
+
+def merge_guide_specks(labels, rgb, regions, speck_ids, log=None):
+    """Merge only sub-outline specks into the nearest Lab neighbor."""
+    log = log if log is not None else []
+    speck_ids = {int(r) for r in speck_ids}
+    if not speck_ids:
+        return labels, regions, log
+    for _ in range(40):
+        regions, colors = label_regions(labels)
+        todo = sorted(rid for rid in speck_ids if rid in np.unique(regions))
+        if not todo:
+            break
+        slices = ndimage.find_objects(regions)
+        changed = False
+        for rid in todo:
+            if rid >= len(colors):
+                continue
+            sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in slices[rid - 1])
+            mask = regions[sl] == rid
+            sub = labels[sl]
+            own_label = int(colors[rid])
+            rgb_crop = rgb[sl]
+            neighbor = None
+            for dil in (1, 2, 4, 8):
+                neighbor = _pick_merge_neighbor_lab(sub, mask, own_label, rgb_crop, dilate=dil)
+                if neighbor is not None:
+                    break
+            if neighbor is None:
+                continue
+            sub[mask] = neighbor
+            log.append(f"merged speck region {rid} into color {neighbor + 1}")
+            speck_ids.discard(rid)
+            changed = True
+        if not changed:
+            break
+    regions, _ = label_regions(labels)
+    return labels, regions, log
+
+
+def _pick_merge_neighbor_lab(sub, mask, own_label, rgb_crop, dilate=1):
+    ring = ndimage.binary_dilation(mask, iterations=dilate) & ~mask
+    if not np.any(ring):
+        return None
+    own_lab = rgb_to_lab(rgb_crop[mask].reshape(-1, 3)).mean(axis=0)
+    ring_labels = sub[ring]
+    best_label, best_key = None, -1.0
+    for nl in np.unique(ring_labels):
+        nl = int(nl)
+        if nl == own_label:
+            continue
+        nmask = ring & (sub == nl)
+        cnt = int(nmask.sum())
+        if cnt == 0:
+            continue
+        nl_lab = rgb_to_lab(rgb_crop[nmask].reshape(-1, 3)).mean(axis=0)
+        dist = float(np.linalg.norm(own_lab - nl_lab))
+        key = cnt / (1.0 + dist * dist)
+        if key > best_key:
+            best_key, best_label = key, nl
+    return best_label
+
+
+def build_guide_polylines(regions, guide_ids, sigma):
+    if not guide_ids:
+        return [], np.zeros((0, 4), dtype=np.float64)
+    paint = np.zeros(regions.shape, dtype=np.int32)
+    for rid in guide_ids:
+        paint[regions == int(rid)] = int(rid)
+    if paint.max() == 0:
+        return [], np.zeros((0, 4), dtype=np.float64)
+    lines = trace_boundaries(paint, sigma=sigma * 0.85, keep_every=2)
+    return chunk_polylines(lines, size=28)
+
+
+def detect_soup_clumps(regions, labels, numbered_ids, guide_ids, eye_mask, mouth_mask, ppi, cell_in=0.35):
+    """Find crowded focal clumps (many small regions per area)."""
+    focal = np.zeros(labels.shape, dtype=bool)
+    if eye_mask is not None:
+        focal |= eye_mask >= 0.35
+    if mouth_mask is not None:
+        focal |= mouth_mask >= 0.35
+    if not np.any(focal):
+        return []
+    small = numbered_ids | guide_ids
+    if not small:
+        return []
+    h, w = labels.shape
+    cell = max(8, int(round(cell_in * ppi)))
+    hot = []
+    for y0 in range(0, h, cell):
+        for x0 in range(0, w, cell):
+            y1, x1 = min(h, y0 + cell), min(w, x0 + cell)
+            patch_f = focal[y0:y1, x0:x1]
+            if patch_f.mean() < 0.08:
+                continue
+            patch_r = regions[y0:y1, x0:x1]
+            ids = {int(r) for r in np.unique(patch_r) if int(r) in small}
+            if len(ids) < 6:
+                continue
+            hot.append((len(ids), x0, y0, x1, y1, ids))
+    if not hot:
+        return []
+    hot.sort(key=lambda t: -t[0])
+    clumps = []
+    used = np.zeros(labels.shape, dtype=bool)
+    for nids, x0, y0, x1, y1, ids in hot:
+        if used[y0:y1, x0:x1].any():
+            continue
+        used[y0:y1, x0:x1] = True
+        pad = int(round(0.15 * max(x1 - x0, y1 - y0)))
+        bx0, by0 = max(0, x0 - pad), max(0, y0 - pad)
+        bx1, by1 = min(w, x1 + pad), min(h, y1 + pad)
+        clumps.append({
+            "box": [bx0, by0, bx1, by1],
+            "region_count": len(ids),
+            "numbered_in_clump": len([i for i in ids if i in numbered_ids]),
+            "guide_in_clump": len([i for i in ids if i in guide_ids]),
+            "peak_cell_regions": nids,
+        })
+    return clumps
+
+
+def write_soup_report(out_dir, clumps, preview_rgb, options):
+    out_dir = Path(out_dir)
+    report = {"clumps": clumps, "options": options}
+    crops_dir = out_dir / "soup_crops"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    for i, clump in enumerate(clumps):
+        x0, y0, x1, y1 = (int(v) for v in clump["box"])
+        crop = preview_rgb[y0:y1, x0:x1]
+        path = crops_dir / f"clump_{i}.png"
+        Image.fromarray(crop).save(path, optimize=True)
+        clump["crop_png"] = str(path.name)
+    (out_dir / "soup_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    return out_dir / "soup_report.json"
+
+
+def plan_detail_inset(box, labels, regions, style, px_to_pt, ppi, inset_id="D1", source="manual"):
+    x0, y0, x1, y1 = (int(v) for v in box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(labels.shape[1], x1), min(labels.shape[0], y1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    sub_r = regions[y0:y1, x0:x1]
+    dist = interior_distance(labels[y0:y1, x0:x1])
+    _, _, min_num_r = printable_region_limits(style, px_to_pt)
+    worst = 1e9
+    for rid in np.unique(sub_r):
+        rid = int(rid)
+        if rid <= 0:
+            continue
+        m = sub_r == rid
+        worst = min(worst, float(dist[m].max()) if np.any(m) else worst)
+    if worst > 1e8:
+        worst = min_num_r
+    magnification = 1.0 if worst >= min_num_r * 0.92 else min(14.0, (min_num_r * 0.92) / max(worst, 0.5))
+    wall_w_in = (x1 - x0) / ppi
+    wall_h_in = (y1 - y0) / ppi
+    return {
+        "id": inset_id,
+        "box": [x0, y0, x1, y1],
+        "wall_w_in": round(wall_w_in, 4),
+        "wall_h_in": round(wall_h_in, 4),
+        "magnification": round(magnification, 3),
+        "source": source,
+    }
+
+
+def resolve_detail_insets(arg, clumps, labels, regions, style, px_to_pt, ppi):
+    arg = (arg or "").strip()
+    if not arg:
+        return []
+    if arg.lower() == "auto":
+        if not clumps:
+            print("detail-inset auto: no soup clumps found")
+            return []
+        pick = max(clumps, key=lambda c: c.get("guide_in_clump", 0) + c.get("numbered_in_clump", 0))
+        ins = plan_detail_inset(pick["box"], labels, regions, style, px_to_pt, ppi, source="auto")
+        return [ins] if ins else []
+    parts = [float(x.strip()) for x in arg.split(",")]
+    if len(parts) != 4:
+        raise SystemExit("--detail-inset must be auto or x0,y0,x1,y1 work pixels")
+    ins = plan_detail_inset(parts, labels, regions, style, px_to_pt, ppi, source="box")
+    return [ins] if ins else []
+
+
+def audit_sheet_legibility(labels, regions, layout, job, style, face_mask=None, eye_mask=None, mouth_mask=None):
+    """Simulate per-sheet number placement; fail on <6 pt, overlap, or boundary violations (guides exempt)."""
+    failures = []
+    k = job["scale"] / job["ppi"]
+    px_to_pt = k * PT
+    _, _, min_r = printable_region_limits(style, px_to_pt)
+    h, w = labels.shape
+    all_boxes = []
+
+    def boxes_for_placed(placed, x0p, y0p):
+        out = []
+        for x, y, text, size in placed:
+            if size < PRINT_ABS_MIN_PT - 0.05:
+                failures.append(f"number {text} at {size:.2f} pt < {PRINT_ABS_MIN_PT} pt")
+            half = math.hypot(stringWidth(text, style.font, size), size * 0.72) / 2
+            bx0, by0 = x + x0p - half, y + y0p - half
+            bx1, by1 = x + x0p + half, y + y0p + half
+            out.append((bx0, by0, bx1, by1, size, text))
+            r = float(interior_distance(labels)[int(y + y0p), int(x + x0p)])
+            if r < min_r * 0.86:
+                failures.append(f"number {text} sits {r:.1f}px from boundary (< {min_r:.1f}px inscribed)")
+        return out
+
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            sx0, sy0 = c * layout.step_x, r * layout.step_y
+            wx0, wy0 = sx0 / k, sy0 / k
+            wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
+            x0p, y0p = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+            x1p, y1p = min(w, int(math.ceil(wx1))), min(h, int(math.ceil(wy1)))
+            cell_x1 = x1p if c == layout.cols - 1 else int(math.ceil((sx0 + layout.step_x) / k))
+            cell_y1 = y1p if r == layout.rows - 1 else int(math.ceil((sy0 + layout.step_y) / k))
+            if cell_y1 <= y0p or cell_x1 <= x0p:
+                continue
+            cell_labels = labels[y0p:cell_y1, x0p:cell_x1]
+            cell_regions = regions[y0p:cell_y1, x0p:cell_x1]
+            placed, labeled = place_numbers(cell_labels, cell_regions, px_to_pt, style)
+            masks = []
+            if face_mask is not None:
+                masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
+            if eye_mask is not None:
+                masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
+            if mouth_mask is not None:
+                masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
+            placed, _ = complete_priority_labels(placed, labeled, cell_labels, cell_regions, px_to_pt, style, masks)
+            sid = sheet_id(r, c)
+            for bx0, by0, bx1, by1, size, text in boxes_for_placed(placed, x0p, y0p):
+                all_boxes.append((sid, bx0, by0, bx1, by1))
+    for i, (sid_a, ax0, ay0, ax1, ay1) in enumerate(all_boxes):
+        for sid_b, bx0, by0, bx1, by1 in all_boxes[i + 1 :]:
+            if ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0:
+                failures.append(f"overlapping numbers on sheets {sid_a} and {sid_b}")
+    return failures
 
 
 def label_regions(labels):
@@ -1552,6 +1900,7 @@ def feet_inches(inches):
 def place_numbers(crop, crop_regions, px_to_pt, style):
     """One number per same-color piece inside the crop, at its most interior point. Returns (labels, region ids labeled)."""
     dist = interior_distance(crop)
+    _, _, min_r = printable_region_limits(style, px_to_pt)
     placed, labeled = [], set()
     for k in np.unique(crop):
         comp, count = ndimage.label(crop == k)
@@ -1563,17 +1912,17 @@ def place_numbers(crop, crop_regions, px_to_pt, style):
         text = str(k + 1)
         half_diag = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
         for radius, (y, x) in zip(radii, spots):
-            # Always place a number so no region is left unlabeled. Tiny face details
-            # may get type as small as 4.5 pt when they can't hold the usual minimum.
-            raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else 4.5
-            size = min(style.max_pt, max(4.5, raw))
+            if radius < min_r * 0.88:
+                continue
+            raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else style.min_pt
+            size = min(style.max_pt, max(PRINT_ABS_MIN_PT, min(style.min_pt, raw)))
             placed.append((x + 0.5, y + 0.5, text, size))
             labeled.add(int(crop_regions[y, x]))
     return placed, labeled
 
 
 def complete_priority_labels(placed, labeled, crop, crop_regions, px_to_pt, style, masks):
-    """Every region touching a priority mask (face/eye) gets a number on the sheet."""
+    """Place numbers on printable focal regions that would otherwise be missed on this sheet."""
     if not masks:
         return placed, labeled
     dist = interior_distance(crop)
@@ -1583,6 +1932,7 @@ def complete_priority_labels(placed, labeled, crop, crop_regions, px_to_pt, styl
             covered |= m >= 0.35
     if not np.any(covered):
         return placed, labeled
+    _, _, min_r = printable_region_limits(style, px_to_pt)
     placed = list(placed)
     labeled = set(labeled)
     for rid in np.unique(crop_regions[covered]):
@@ -1598,8 +1948,10 @@ def complete_priority_labels(placed, labeled, crop, crop_regions, px_to_pt, styl
         sub = np.where(m, dist, 0)
         cy, cx = np.unravel_index(sub.argmax(), sub.shape)
         radius = float(dist[cy, cx])
+        if radius < min_r * 0.88:
+            continue
         raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else style.min_pt
-        size = min(style.max_pt, max(4.5, raw))
+        size = min(style.max_pt, max(PRINT_ABS_MIN_PT, min(style.min_pt, raw)))
         placed.append((cx + 0.5, cy + 0.5, text, size))
         labeled.add(rid)
     return placed, labeled
@@ -1805,7 +2157,74 @@ INSTRUCTIONS = {
 }
 
 
-def draw_map(cv, job, preview, layout, mural_w, mural_h):
+def draw_painting_instructions(cv, job, has_guides, detail_insets):
+    """Explain freehand guide shapes and detail reference sheets."""
+    pw, ph = letter
+    cv.setPageSize(letter)
+    x0, top = MARGIN * PT + 24, ph - MARGIN * PT - 28
+    cv.setFont("Helvetica-Bold", 16)
+    cv.drawString(x0, top, "How to paint this kit")
+    cv.setFont("Helvetica", 10)
+    yy = top - 22
+    lines = [
+        "Paint by number on the main sheets first. Use the enclosed color preview (preview.png) to check color "
+        "relationships while you work.",
+    ]
+    if job["scale"] != 1:
+        lines.append(
+            f"These tracing sheets are at {job['scale'] * 100:g}% scale — a size reference, not wall-size templates. "
+            "Reprint at --scale 1 for true-size tracing when available."
+        )
+    else:
+        lines.append("Print every main sheet at 100% / Actual size so the 2 in scale bar measures 2 in on paper.")
+    for line in lines:
+        cv.setFont("Helvetica", fit_text(line, "Helvetica", 10, pw - 2 * x0))
+        cv.drawString(x0, yy, line)
+        yy -= 14
+
+    if has_guides:
+        yy -= 6
+        cv.setFont("Helvetica-Bold", 12)
+        cv.drawString(x0, yy, "Freehand guide shapes (no number)")
+        yy -= 16
+        guide_lines = [
+            "Some small areas are shown with dashed outlines and deliberately have no number. Fill them freehand to "
+            "match the neighboring numbered colors, using the color preview as your reference.",
+            "These guides keep tiny details (eyes, fur edges, whiskers) without cramming unreadable numbers onto the sheet.",
+        ]
+        for line in guide_lines:
+            cv.setFont("Helvetica", fit_text(line, "Helvetica", 10, pw - 2 * x0))
+            cv.drawString(x0, yy, line)
+            yy -= 13
+
+    if detail_insets:
+        yy -= 6
+        cv.setFont("Helvetica-Bold", 12)
+        cv.drawString(x0, yy, "Detail sections (D1, D2, …)")
+        yy -= 16
+        det_lines = [
+            "When a crowded area would be hard to read on the main sheet, an enlarged detail page is included (for "
+            "example D1). The main sheet marks that zone with “see detail D1”.",
+            "Paint the main sheet first. Use the detail page only as an enlarged color-and-number reference for that "
+            "zone — do not enlarge or trace the detail page onto the wall.",
+            "The magnification printed on each detail sheet is for reference only; only main sheets match wall scale "
+            "when printed at 100%.",
+        ]
+        ids = ", ".join(ins["id"] for ins in detail_insets)
+        det_lines.append(f"This kit includes detail sheet(s): {ids}.")
+        for line in det_lines:
+            cv.setFont("Helvetica", fit_text(line, "Helvetica", 10, pw - 2 * x0))
+            cv.drawString(x0, yy, line)
+            yy -= 13
+
+    yy -= 8
+    cv.setFont("Helvetica-Oblique", 9)
+    cv.drawString(x0, yy, "Questions? Re-run with --soup-report to review crowded focal areas before printing.")
+    cv.showPage()
+    return 1
+
+
+def draw_map(cv, job, preview, layout, mural_w, mural_h, detail_insets=None):
     page = landscape(letter) if mural_w >= mural_h else letter
     cv.setPageSize(page)
     pw, ph = page
@@ -1841,6 +2260,23 @@ def draw_map(cv, job, preview, layout, mural_w, mural_h):
             cx = mx + (c * layout.step_x + min((c + 1) * layout.step_x, mural_w)) / 2 * s
             cy = my + mh - (r * layout.step_y + min((r + 1) * layout.step_y, mural_h)) / 2 * s
             cv.drawCentredString(cx, cy - font * 0.35, sheet_id(r, c))
+
+    if detail_insets:
+        k = job["scale"] / job["ppi"]
+        cv.setStrokeColor(HexColor("#c45c00"))
+        cv.setLineWidth(1.0)
+        cv.setDash(4, 3)
+        for ins in detail_insets:
+            x0, y0, x1, y1 = ins["box"]
+            mx0 = mx + x0 * k * s
+            my0 = my + mh - y1 * k * s
+            mx1 = mx + x1 * k * s
+            my1 = my + mh - y0 * k * s
+            cv.rect(mx0, my0, mx1 - mx0, my1 - my0, stroke=1, fill=0)
+            cv.setFillColor(HexColor("#c45c00"))
+            cv.setFont("Helvetica-Bold", max(6.0, font * 0.85))
+            cv.drawCentredString((mx0 + mx1) / 2, (my0 + my1) / 2, ins["id"])
+        cv.setDash()
 
     cv.setFont("Helvetica", 9)
     cv.drawCentredString(mx + mw / 2, my + mh + 6,
@@ -1893,8 +2329,75 @@ def neighbor_tag(cv, x, y, text, direction):
         cv.drawString(x + 6, y - 2.5, text)
 
 
+def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma):
+    """Enlarged reference page for a focal clump (not wall-size)."""
+    page = letter
+    cv.setPageSize(page)
+    pw, ph = page
+    left, bottom = MARGIN * PT, (MARGIN + FOOTER) * PT
+    cw, ch = pw - 2 * MARGIN * PT, ph - 2 * MARGIN * PT - HEADER * PT - FOOTER * PT
+    x0, y0, x1, y1 = (int(v) for v in inset["box"])
+    crop_labels = labels[y0:y1, x0:x1]
+    crop_regions = regions[y0:y1, x0:x1]
+    mag = float(inset["magnification"])
+    k_base = job["scale"] / job["ppi"]
+    k = k_base / max(mag, 1.0)
+    wall_w_px, wall_h_px = x1 - x0, y1 - y0
+    tile_w_in, tile_h_in = wall_w_px * k, wall_h_px * k
+    s_fit = min(cw / (tile_w_in * PT), ch / (tile_h_in * PT))
+    cw_use, ch_use = tile_w_in * PT * s_fit, tile_h_in * PT * s_fit
+    top = bottom + ch_use
+    did = inset["id"]
+
+    def to_page(x_px, y_px):
+        return left + (x_px * k * PT) * s_fit, top - (y_px * k * PT) * s_fit
+
+    lines = trace_boundaries(crop_labels, sigma=sigma * 0.95)
+    chunks, boxes = chunk_polylines(lines, size=36)
+    cv.saveState()
+    clip = cv.beginPath()
+    clip.rect(left, bottom, cw_use, ch_use)
+    cv.clipPath(clip, stroke=0, fill=0)
+    path = cv.beginPath()
+    for chunk in chunks:
+        pts = [(float(x), float(y)) for x, y in chunk]
+        path.moveTo(*to_page(pts[0][0] + x0, pts[0][1] + y0))
+        for x, y in pts[1:]:
+            path.lineTo(*to_page(x + x0, y + y0))
+    cv.setStrokeGray(style.line_gray)
+    cv.setLineWidth(style.line_pt)
+    cv.drawPath(path, stroke=1, fill=0)
+    cv.restoreState()
+
+    px_to_pt = k * PT * s_fit
+    placed, labeled = place_numbers(crop_labels, crop_regions, px_to_pt, style)
+    cv.setFillColor(HexColor("#000000"))
+    for x, y, text, size in placed:
+        px, py = to_page(x + x0, y + y0)
+        cv.setFont(style.font, size * s_fit)
+        cv.drawCentredString(px, py - 0.36 * size * s_fit, text)
+
+    cv.setFillColor(HexColor("#000000"))
+    hy = bottom + ch_use + 8
+    title = (
+        f"Detail {did}  ·  {mag:g}× enlarged reference for "
+        f"{inset['wall_w_in']:.2f}×{inset['wall_h_in']:.2f} in on the wall  ·  NOT wall-size"
+    )
+    cv.setFont("Helvetica-Bold", fit_text(title, "Helvetica-Bold", 10, cw_use))
+    cv.drawString(left, hy, title)
+    cv.setFont("Helvetica", 8)
+    cv.drawString(
+        left,
+        hy - 12,
+        "Paint the main sheet first; use this page only to read numbers/colors for the marked zone.",
+    )
+    cv.showPage()
+    return labeled
+
+
 def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions, palette, style,
-               face_mask=None, eye_mask=None, mouth_mask=None):
+               face_mask=None, eye_mask=None, mouth_mask=None, guide_chunks=None, guide_boxes=None,
+               detail_insets=None):
     page = (layout.page_w * PT, layout.page_h * PT)
     cv.setPageSize(page)
     k = job["scale"] / job["ppi"]                 # paper inches per work pixel
@@ -1964,10 +2467,49 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     cv.setLineJoin(1)
     cv.setLineCap(1)
     cv.drawPath(path, stroke=1, fill=0)
+    if guide_chunks is not None and guide_boxes is not None and len(guide_chunks):
+        ghit = np.nonzero(
+            (guide_boxes[:, 2] >= wx0) & (guide_boxes[:, 0] <= wx1)
+            & (guide_boxes[:, 3] >= wy0) & (guide_boxes[:, 1] <= wy1)
+        )[0]
+        gpath = cv.beginPath()
+        for i in ghit:
+            pts = guide_chunks[i]
+            gpath.moveTo(*to_page(*pts[0]))
+            for x, y in pts[1:]:
+                gpath.lineTo(*to_page(x, y))
+        cv.setStrokeColor(HexColor("#444444"))
+        cv.setLineWidth(max(0.35, style.line_pt * 0.55))
+        cv.setDash(3, 2)
+        cv.drawPath(gpath, stroke=1, fill=0)
+        cv.setDash()
     cv.setStrokeColor(HexColor("#000000"))
     cv.setLineWidth(max(style.line_pt, 1.2))
     cv.rect(left - sx0 * PT, top - mural_h * PT + sy0 * PT, mural_w * PT, mural_h * PT, stroke=1, fill=0)
     cv.restoreState()
+
+    if detail_insets:
+        cv.saveState()
+        clip = cv.beginPath()
+        clip.rect(left, bottom, cw, ch)
+        cv.clipPath(clip, stroke=0, fill=0)
+        for ins in detail_insets:
+            bx0, by0, bx1, by1 = (int(v) for v in ins["box"])
+            ix0, iy0 = max(wx0, bx0), max(wy0, by0)
+            ix1, iy1 = min(wx1, bx1), min(wy1, by1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            p0 = to_page(ix0, iy0)
+            p1 = to_page(ix1, iy1)
+            cv.setStrokeColor(HexColor("#c45c00"))
+            cv.setLineWidth(1.1)
+            cv.setDash(5, 3)
+            cv.rect(p0[0], p1[1], p1[0] - p0[0], p0[1] - p1[1], stroke=1, fill=0)
+            cv.setFillColor(HexColor("#c45c00"))
+            cv.setFont("Helvetica-Bold", 7)
+            cv.drawString(p0[0] + 2, p0[1] - 8, f"see detail {ins['id']}")
+        cv.setDash()
+        cv.restoreState()
 
     # Color numbers go only in this sheet's map cell (tile minus the right/bottom bands). Later sheets are
     # taped over those bands, so every spot on the wall gets its number from exactly one visible sheet.
@@ -1986,7 +2528,8 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
         masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
     if mouth_mask is not None:
         masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
-    placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, k * PT, style, masks)
+    if masks:
+        placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, k * PT, style, masks)
     cv.setFillColor(HexColor("#000000"))
     for x, y, text, size in placed:
         px, py = to_page(x + x0p, y + y0p)
@@ -2057,6 +2600,9 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     if job["scale"] != 1:
         label += f" (= {2 / job['scale']:g} in of wall)"
     cv.drawString(bar_x, fy + 12, label)
+    if guide_chunks:
+        cv.setFont("Helvetica", 6.5)
+        cv.drawString(left, fy - 2, "Dashed outline = freehand guide (no number); match neighboring colors using the preview.")
 
     cell_w, cell_h = grid_w / layout.cols, grid_h / layout.rows
     cv.setLineWidth(0.3)
@@ -2191,6 +2737,63 @@ def render_focal_sheet_crop(
     return canvas
 
 
+def render_focal_sheet_framed(
+    job_dir,
+    layout,
+    job,
+    box,
+    eye_mask=None,
+    mouth_mask=None,
+    face_mask=None,
+    mural_w=None,
+    mural_h=None,
+    dpi=192,
+    pad_frac=0.12,
+):
+    """Rasterize the sheet that owns most of the focal area (not a multi-sheet paste)."""
+    if box is None:
+        return None
+    job_dir = Path(job_dir)
+    pdf = ensure_full_mural_pdf(job_dir)
+    if pdf is None:
+        return render_focal_sheet_crop(
+            job_dir, layout, job, box, eye_mask, mouth_mask, face_mask,
+            mural_w=mural_w, mural_h=mural_h, dpi=dpi,
+        )
+    k = job["scale"] / job["ppi"]
+    pick = _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask)
+    if pick is None:
+        return render_focal_sheet_crop(
+            job_dir, layout, job, box, eye_mask, mouth_mask, face_mask,
+            mural_w=mural_w, mural_h=mural_h, dpi=dpi,
+        )
+    r, c = pick[0], pick[1]
+    page_num = _sheet_pdf_page(_front_pages_for_full_build(job_dir), layout, r, c)
+    page = rasterize_pdf_page(pdf, page_num, dpi=dpi)
+    if page is None:
+        return None
+    page = np.asarray(page)
+    ph, pw = page.shape[:2]
+    x0, y0, x1, y1 = (int(v) for v in box)
+    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+    ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
+    ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    dx, dy = (ix1 - ix0) * pad_frac, (iy1 - iy0) * pad_frac
+    fx0, fy0 = max(wx0, ix0 - dx), max(wy0, iy0 - dy)
+    fx1, fy1 = min(wx1, ix1 + dx), min(wy1, iy1 + dy)
+    xa0, ya0 = _work_px_to_page_px(fx0, fy0, r, c, layout, job, dpi)
+    xa1, ya1 = _work_px_to_page_px(fx1, fy1, r, c, layout, job, dpi)
+    px0, px1 = int(round(min(xa0, xa1))), int(round(max(xa0, xa1)))
+    py0, py1 = int(round(min(ya0, ya1))), int(round(max(ya0, ya1)))
+    px0, py0 = max(0, px0), max(0, py0)
+    px1, py1 = min(pw, px1), min(ph, py1)
+    if px1 <= px0 or py1 <= py0:
+        return None
+    return page[py0:py1, px0:px1]
+
+
 def _best_face_sheet(layout, face_mask, k, min_weight=1.0):
     if face_mask is None or float(face_mask.max()) < 0.1:
         return None
@@ -2255,16 +2858,20 @@ def pick_preview_sheets(preview_sheets, layout, regions, face, k, face_mask=None
 
 def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
                           chunks, boxes, labels, regions, palette_arr, style, sample_sheets,
-                          face_mask=None, eye_mask=None, mouth_mask=None):
+                          face_mask=None, eye_mask=None, mouth_mask=None, guide_chunks=None,
+                          guide_boxes=None, detail_insets=None, has_guides=False):
     cv = Canvas(str(path), pagesize=letter, invariant=1, pageCompression=1)
     cv.setTitle("Paint-by-number mural (preview)")
     cover_pages, key_on_cover = draw_cover(cv, job, small, palette, areas, brand_map, layout)
     if not key_on_cover:
         draw_color_key_pages(cv, job, palette, areas, brand_map)
-    draw_map(cv, job, small, layout, mural_w, mural_h)
+    if has_guides or detail_insets:
+        draw_painting_instructions(cv, job, has_guides, detail_insets or [])
+    draw_map(cv, job, small, layout, mural_w, mural_h, detail_insets=detail_insets)
     for r, c, _reason in sample_sheets:
         draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
-                   palette_arr, style, face_mask=face_mask, eye_mask=eye_mask, mouth_mask=mouth_mask)
+                   palette_arr, style, face_mask=face_mask, eye_mask=eye_mask, mouth_mask=mouth_mask,
+                   guide_chunks=guide_chunks, guide_boxes=guide_boxes, detail_insets=detail_insets)
     cv.save()
     return cover_pages
 
@@ -2568,14 +3175,74 @@ def main():
             window = int(round(a.min_region_in / 4 * ppi)) | 1
             labels = majority_filter(labels, a.colors, window)
             labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
+        min_guide_in = a.min_guide_region_in
+        if min_guide_in is None:
+            min_guide_in = default_min_guide_in(a.min_region_in)
+        regions, region_colors = label_regions(labels)
+        px_to_pt_floor = (a.scale / ppi) * PT
+        numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+            regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
+        )
+        if a.merge_guide_specks and speck_ids:
+            speck_log = []
+            labels, regions, speck_log = merge_guide_specks(labels, rgb, regions, speck_ids, log=speck_log)
+            for line in speck_log:
+                print(f"guide speck: {line}")
+            regions, region_colors = label_regions(labels)
+            numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+                regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
+            )
         labels, palette = finalize_palette(
             labels, rgb, face.get("eye_mask"), face.get("mouth_mask"), face.get("mask"),
         )
         regions, region_colors = label_regions(labels)
+        numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+            regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
+        )
     n = len(palette)
     face_mask = face.get("mask")
     eye_mask = face.get("eye_mask")
     mouth_mask = face.get("mouth_mask")
+
+    px_to_pt_floor = (a.scale / ppi) * PT
+    min_guide_in = a.min_guide_region_in or default_min_guide_in(a.min_region_in)
+    if getattr(a, "_from_preview_dir", None):
+        prev_meta = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text())
+        numbered_ids, guide_ids, speck_ids = classify_placement_regions(
+            regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
+        )
+        detail_insets = prev_meta.get("detail_insets") or []
+        soup_clumps = prev_meta.get("soup_clumps")
+        if a.detail_inset and not detail_insets:
+            soup_clumps = soup_clumps or detect_soup_clumps(
+                regions, labels, numbered_ids, guide_ids, eye_mask, mouth_mask, ppi,
+            )
+            detail_insets = resolve_detail_insets(
+                a.detail_inset, soup_clumps, labels, regions, style, px_to_pt_floor, ppi,
+            )
+    else:
+        soup_clumps = detect_soup_clumps(
+            regions, labels, numbered_ids, guide_ids, eye_mask, mouth_mask, ppi,
+        )
+        if a.soup_report:
+            options = [
+                {"action": "lower_detail", "detail": "low", "note": "fewer colors / larger regions"},
+                {"action": "detail_inset", "flag": "--detail-inset auto", "note": "add enlarged detail sheet"},
+            ]
+            preview_rgb = palette[labels]
+            write_soup_report(a.out, soup_clumps, preview_rgb, options)
+            print(f"soup report: {a.out / 'soup_report.json'} ({len(soup_clumps)} clump(s))")
+        detail_insets = resolve_detail_insets(
+            a.detail_inset, soup_clumps, labels, regions, style, px_to_pt_floor, ppi,
+        )
+    a.placement_meta = {
+        "numbered_regions": len(numbered_ids),
+        "guide_regions": len(guide_ids),
+        "speck_regions": len(speck_ids),
+        "min_guide_region_in": min_guide_in,
+    }
+    a.detail_insets_resolved = detail_insets
+    a.soup_clumps = soup_clumps
 
     wall_sqft = wall_w_in * wall_h_in / 144
     counts = np.bincount(labels.ravel(), minlength=n)
@@ -2595,6 +3262,7 @@ def main():
            "transfer": a.transfer, "brand": a.brand, "overlap": a.overlap_in, "scale": a.scale, "ppi": ppi,
            "fit_note": fit_note, "sheet_tint": a.sheet_tint, "detail": a.detail}
     sigma = trace_sigma(ppi, a.min_region_in, face)
+    guide_chunks, guide_boxes = build_guide_polylines(regions, guide_ids, sigma)
 
     a.out.mkdir(parents=True, exist_ok=True)
     preview = Image.fromarray(palette[labels])
@@ -2606,16 +3274,24 @@ def main():
     cv.setTitle("Paint-by-number mural")
     cover_pages, key_on_cover = draw_cover(cv, job, small, palette, areas, brand_map, layout)
     key_pages = 0 if key_on_cover else draw_color_key_pages(cv, job, palette, areas, brand_map)
-    draw_map(cv, job, small, layout, mural_w, mural_h)
-    front_pages = cover_pages + key_pages + 1  # cover + optional key pages + placement map
+    instr_pages = 0
+    if guide_ids or detail_insets:
+        instr_pages = draw_painting_instructions(cv, job, bool(guide_ids), detail_insets)
+    draw_map(cv, job, small, layout, mural_w, mural_h, detail_insets=detail_insets)
+    front_pages = cover_pages + key_pages + instr_pages + 1
     labeled = set()
     chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=sigma))
     f_mask, e_mask, m_mask = face_mask, eye_mask, mouth_mask
     if not a.preview_only:
         for r in range(layout.rows):
             for c in range(layout.cols):
-                labeled |= draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
-                                      palette, style, face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask)
+                labeled |= draw_sheet(
+                    cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
+                    palette, style, face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask,
+                    guide_chunks=guide_chunks, guide_boxes=guide_boxes, detail_insets=detail_insets,
+                )
+        for ins in detail_insets or []:
+            labeled |= draw_detail_sheet(cv, job, ins, labels, regions, palette, style, sigma)
     cv.save()
 
     preview_samples = []
@@ -2626,9 +3302,13 @@ def main():
         k_sheet = job["scale"] / job["ppi"]
         preview_samples = pick_preview_sheets(a.preview_sheets, layout, regions, face, k_sheet, face_mask)
         kit_pdf = a.out / "preview_kit.pdf"
-        build_preview_kit_pdf(kit_pdf, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
-                              chunks, boxes, labels, regions, palette, style, preview_samples,
-                              face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask)
+        build_preview_kit_pdf(
+            kit_pdf, job, small, palette, areas, brand_map, layout, mural_w, mural_h,
+            chunks, boxes, labels, regions, palette, style, preview_samples,
+            face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask,
+            guide_chunks=guide_chunks, guide_boxes=guide_boxes, detail_insets=detail_insets,
+            has_guides=bool(guide_ids),
+        )
         outlined = a.out / "preview_outlined.png"
         draw_preview_outlined(outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style)
         pages_dir = a.out / "preview_pages"
@@ -2653,6 +3333,9 @@ def main():
         "sheets": {"count": layout.count, "rows": layout.rows, "cols": layout.cols,
                    "orientation": "landscape" if layout.landscape else "portrait", "overlap_in": a.overlap_in},
         "regions": int(regions.max()),
+        "placement": a.placement_meta,
+        "detail_insets": detail_insets,
+        "soup_clump_count": len(soup_clumps or []),
         "front_pages": front_pages,
         "colors": areas,
         "subject_priority": _subject_meta_for_json(face),
@@ -2681,7 +3364,10 @@ def main():
         },
     }
     if not a.preview_only:
-        summary["unlabeled_regions"] = int(regions.max()) - len(labeled)
+        all_ids = {int(r) for r in np.unique(regions) if int(r) > 0}
+        summary["guide_regions"] = len(guide_ids)
+        summary["numbered_regions"] = len(numbered_ids)
+        summary["unlabeled_regions"] = len(all_ids - labeled - {int(r) for r in guide_ids})
         if getattr(a, "_from_preview_dir", None):
             saved_lm = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text()).get("label_metrics", {})
             live = summary["label_metrics"]
@@ -2697,6 +3383,8 @@ def main():
           f"{pdf_mb:.1f} MB -> {a.out / 'mural.pdf'}")
     if summary.get("unlabeled_regions"):
         print(f"warning: {summary['unlabeled_regions']} regions got no number on any sheet")
+    if summary.get("guide_regions"):
+        print(f"freehand guide shapes: {summary['guide_regions']} regions (dashed, unnumbered)")
 
 
 if __name__ == "__main__":

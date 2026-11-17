@@ -19,7 +19,7 @@ from mural_tiler import (  # noqa: E402
     apply_image_prep,
     choose_layout,
     fit_to_wall,
-    render_focal_sheet_crop,
+    render_focal_sheet_framed,
     rgb_to_lab,
     resolve_faces,
 )
@@ -155,8 +155,8 @@ def analyze_dir(job_dir: Path, tag: str):
     lm = meta["label_metrics"]
     box = focal_bbox(face)
     mural_w, mural_h = wall_w_in * scale, wall_h_in * scale
-    sheet = render_focal_sheet_crop(
-        job_dir, layout, job, box, eye_mask, mouth_mask, face_mask, mural_w=mural_w, mural_h=mural_h,
+    sheet = render_focal_sheet_framed(
+        job_dir, layout, job, box, eye_mask, mouth_mask, face_mask, mural_w=mural_w, mural_h=mural_h, dpi=300,
     )
     row = {
         "tag": tag,
@@ -291,7 +291,7 @@ def main():
     quality_failed = False
     for level in LEVELS:
         tag = f"{level}_wall"
-        fails = audit_job(after_root / tag, check_sheet_crop=True)
+        fails = audit_job(after_root / tag, check_sheet_crop=True, check_legibility=True)
         if fails:
             quality_failed = True
             print(f"QUALITY FAIL {tag}: {fails}")

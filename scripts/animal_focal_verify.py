@@ -110,7 +110,7 @@ def main():
         out_img = artifact / f"{slug}_focal_grid.jpg"
         build_grid(grid_rows, out_img)
         for level in DETAIL_LEVELS:
-            fails = audit_job(after_root / f"{slug}_{level}_wall", check_sheet_crop=True)
+            fails = audit_job(after_root / f"{slug}_{level}_wall", check_sheet_crop=True, check_legibility=True)
             if fails:
                 print(f"QUALITY FAIL {slug}_{level}_wall: {fails}")
         print(f"wrote {out_img}")
@@ -119,7 +119,7 @@ def main():
     quality_failed = False
     for kind, img_path, slug in ANIMALS:
         for level in DETAIL_LEVELS:
-            fails = audit_job(after_root / f"{slug}_{level}_wall", check_sheet_crop=True)
+            fails = audit_job(after_root / f"{slug}_{level}_wall", check_sheet_crop=True, check_legibility=True)
             if fails:
                 quality_failed = True
     return 1 if quality_failed else 0
