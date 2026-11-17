@@ -80,16 +80,76 @@ def describe(buy):
     return " + ".join(f"{n} {names[k][n != 1]}" for k, n in sorted(buy.items(), key=lambda kv: -CAN_GAL[kv[0]]))
 
 
+def smallest_purchase(prices):
+    """One unit of the smallest priced container size."""
+    for size in ("sample", "quart", "gallon"):
+        if size in prices:
+            return {size: 1}
+    return {}
+
+
+def color_has_area(c, wall_sqft):
+    if c.get("pixel_share", 0) > 0:
+        return True
+    if c.get("sqft", 0) > 0:
+        return True
+    return effective_sqft(c, wall_sqft) > 0
+
+
+def effective_sqft(c, wall_sqft):
+    sq = float(c.get("sqft") or 0)
+    if sq > 0:
+        return sq
+    share = float(c.get("pixel_share") or 0)
+    if share > 0 and wall_sqft:
+        return share * wall_sqft
+    return 0.0
+
+
+def format_area(sqft):
+    if sqft <= 0:
+        return "0"
+    if sqft < 1.0:
+        return f"{sqft * 144:.1f} sq in"
+    return f"{sqft:.1f} sq ft"
+
+
+def format_total_area(total_sqft):
+    if total_sqft < 1.0:
+        return f"{total_sqft * 144:.1f} sq in"
+    return f"{total_sqft:.1f} sq ft"
+
+
+def job_area_header(areas):
+    sq = float(areas.get("wall_sqft") or 0)
+    wf, wh = areas.get("wall_width_ft"), areas.get("wall_height_ft")
+    if wf is not None and wh is not None and sq < 2.0:
+        w_in, h_in = wf * 12, wh * 12
+
+        def fmt_in(x):
+            r = round(x)
+            return str(int(r)) if abs(x - r) < 0.05 else f"{x:.1f}"
+
+        return f"{fmt_in(w_in)} x {fmt_in(h_in)} in canvas (~{sq:.2f} sq ft)"
+    return f"{sq:.1f} sq ft wall"
+
+
 def build_rows(areas, coats, coverage, waste, prices):
+    wall_sqft = float(areas.get("wall_sqft") or 0)
     rows = []
     for c in areas["colors"]:
-        need = gallons_needed(c["sqft"], coats, coverage, waste)
+        sqft = effective_sqft(c, wall_sqft)
+        need = gallons_needed(sqft, coats, coverage, waste)
         buy = best_purchase(need, prices)
+        if color_has_area(c, wall_sqft) and not buy:
+            buy = smallest_purchase(prices)
         match = c.get("brand_match")
         rows.append({
             "color": c["index"], "hex": c["hex"],
             "brand_match": f"{match['name']} ({match['code']}), approximate" if match else "",
-            "sqft": c["sqft"], "gallons_needed": round(need, 3), "fl_oz_needed": round(need * 128, 1),
+            "sqft": sqft,
+            "area_display": format_area(sqft),
+            "gallons_needed": round(need, 3), "fl_oz_needed": round(need * 128, 1),
             "buy": describe(buy), "est_cost": round(sum(prices[k] * v for k, v in buy.items()), 2),
         })
     return rows
@@ -97,12 +157,13 @@ def build_rows(areas, coats, coverage, waste, prices):
 
 def write_md(path, rows, header):
     lines = ["# Paint shopping list", "", header, "",
-             "| # | Color | Brand match | Sq ft | Gal needed | Fl oz | Buy | Est. cost |",
+             "| # | Color | Brand match | Area | Gal needed | Fl oz | Buy | Est. cost |",
              "|---|---|---|---:|---:|---:|---|---:|"]
     for r in rows:
-        lines.append(f"| {r['color']} | {r['hex']} | {r['brand_match'] or '-'} | {r['sqft']:.1f} | "
+        lines.append(f"| {r['color']} | {r['hex']} | {r['brand_match'] or '-'} | {r['area_display']} | "
                      f"{r['gallons_needed']:.2f} | {r['fl_oz_needed']:.1f} | {r['buy']} | ${r['est_cost']:.2f} |")
-    lines.append(f"| | | **Total** | **{sum(r['sqft'] for r in rows):.1f}** | "
+    total_sq = sum(r["sqft"] for r in rows)
+    lines.append(f"| | | **Total** | **{format_total_area(total_sq)}** | "
                  f"**{sum(r['gallons_needed'] for r in rows):.2f}** | **{sum(r['fl_oz_needed'] for r in rows):.0f}** | | **${sum(r['est_cost'] for r in rows):.2f}** |")
     path.write_text("\n".join(lines) + "\n")
 
@@ -141,7 +202,7 @@ def write_pdf(path, rows, header, notes):
     cv = Canvas(str(path), pagesize=letter, invariant=1)
     x0, top = 50, ph - 50
     width = pw - 2 * x0
-    cols = [("#", 0), ("Color", 18), ("Brand match", 62), ("Sq ft", 282), ("Gal", 322), ("Fl oz", 360), ("Buy", 375),
+    cols = [("#", 0), ("Color", 18), ("Brand match", 62), ("Area", 282), ("Gal", 322), ("Fl oz", 360), ("Buy", 375),
             ("Est.", 512)]
     row_h = MIN_LIST_ROW_H
     size = 8.0
@@ -214,7 +275,7 @@ def write_pdf(path, rows, header, notes):
         while brand and stringWidth(brand, "Helvetica", size) > 205:
             brand = brand[:-1]
         cv.drawString(x0 + 62, y + 1, brand)
-        cv.drawRightString(x0 + 282, y + 1, f"{r['sqft']:.1f}")
+        cv.drawRightString(x0 + 282, y + 1, r["area_display"])
         cv.drawRightString(x0 + 322, y + 1, f"{r['gallons_needed']:.2f}")
         cv.drawRightString(x0 + 360, y + 1, f"{r['fl_oz_needed']:.1f}")
         cv.drawString(x0 + 375, y + 1, r["buy"])
@@ -234,7 +295,7 @@ def write_pdf(path, rows, header, notes):
         y -= 8
         cv.setFont("Helvetica-Bold", 9)
         for name, dx in cols:
-            if name in ("Sq ft", "Gal", "Fl oz", "Est."):
+            if name in ("Area", "Gal", "Fl oz", "Est."):
                 cv.drawRightString(x0 + dx, y, name)
             else:
                 cv.drawString(x0 + dx, y, name)
@@ -249,7 +310,7 @@ def write_pdf(path, rows, header, notes):
             cv.setFillColor(HexColor("#000000"))
             cv.setFont("Helvetica-Bold", 9)
             cv.drawString(x0 + 62, y, "Total")
-            cv.drawRightString(x0 + 282, y, f"{sum(r['sqft'] for r in rows):.1f}")
+            cv.drawRightString(x0 + 282, y, format_total_area(sum(r["sqft"] for r in rows)))
             cv.drawRightString(x0 + 322, y, f"{sum(r['gallons_needed'] for r in rows):.2f}")
             cv.drawRightString(x0 + 360, y, f"{sum(r['fl_oz_needed'] for r in rows):.0f}")
             cv.drawRightString(x0 + 512, y, f"${sum(r['est_cost'] for r in rows):.2f}")
@@ -304,7 +365,7 @@ def main():
     rows = build_rows(areas, coats, coverage, a.waste, a.prices)
     price_text = ", ".join(f"{k} ${v:.2f}" for k, v in sorted(a.prices.items(), key=lambda kv: CAN_GAL[kv[0]]))
     brand = f"{areas['brand']} · " if areas.get("brand") else ""
-    header = (f"{brand}{areas['wall_sqft']:.0f} sq ft wall · {coats} coat{'s' if coats > 1 else ''} · "
+    header = (f"{brand}{job_area_header(areas)} · {coats} coat{'s' if coats > 1 else ''} · "
               f"{coverage:g} sq ft/gal per coat · +{a.waste * 100:g}% waste · prices: {price_text}")
     notes = [
         "Gallons = sq ft x coats / coverage x (1 + waste). Buys: the cheapest mix of cans, or the smallest one within 10% of it.",
