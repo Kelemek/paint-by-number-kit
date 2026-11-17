@@ -37,6 +37,15 @@ from reportlab.pdfgen.canvas import Canvas
 from scipy import ndimage
 from sklearn.cluster import KMeans
 
+from legibility_layout import (
+    LEADER_GRAY,
+    LEADER_LINE_PT,
+    NumberPlacement,
+    collect_all_placements,
+    merge_crowded_regions,
+    place_cell_labels,
+)
+
 PT = 72.0                 # PDF points per inch
 MARGIN = 0.25             # printer-safe page margin, inches
 HEADER, FOOTER = 0.25, 0.45
@@ -1582,8 +1591,25 @@ def _aabb_overlap(a, b, pad=0.35):
 
 
 def _placement_overlaps(placed, x, y, text, size, px_to_pt, style):
-  boxes = [_number_aabb_work(px, py, t, sz, style.font, px_to_pt) for px, py, t, sz in placed]
-  return any(_aabb_overlap(box, _number_aabb_work(x, y, text, size, style.font, px_to_pt)) for box in boxes)
+    boxes = [_number_aabb_work(px, py, t, sz, style.font, px_to_pt) for px, py, t, sz in placed]
+    return any(_aabb_overlap(box, _number_aabb_work(x, y, text, size, style.font, px_to_pt)) for box in boxes)
+
+
+def draw_number_placements(cv, to_page, placements, style):
+    cv.setStrokeGray(LEADER_GRAY)
+    cv.setLineWidth(LEADER_LINE_PT)
+    for p in placements:
+        if not p.is_callout:
+            continue
+        x0, y0 = to_page(p.dot_x, p.dot_y)
+        x1, y1 = to_page(p.num_x, p.num_y)
+        cv.line(x0, y0, x1, y1)
+        cv.circle(x0, y0, max(LEADER_LINE_PT * 1.4, 0.8), stroke=1, fill=1)
+    cv.setFillColor(HexColor("#000000"))
+    for p in placements:
+        px, py = to_page(p.num_x, p.num_y)
+        cv.setFont(style.font, p.size)
+        cv.drawCentredString(px, py - 0.36 * p.size, p.text)
 
 
 def place_numbers(crop, crop_regions, px_to_pt, style):
@@ -1693,40 +1719,7 @@ def sheet_guide_region_ids(cell_regions, labeled):
 
 def collect_placed_numbers(labels, regions, layout, job, style, face_mask=None, eye_mask=None, mouth_mask=None):
     """Same placement as draw_sheet cells — for parity checks and preview PNG."""
-    k = job["scale"] / job["ppi"]
-    mural_w = job["wall_w_in"] * job["scale"]
-    mural_h = job["wall_h_in"] * job["scale"]
-    px_to_pt = k * PT
-    placed_all = []
-    labeled_all = set()
-    guide_all = set()
-    h, w = labels.shape
-    for r in range(layout.rows):
-        for c in range(layout.cols):
-            sx0, sy0 = c * layout.step_x, r * layout.step_y
-            wx0, wy0 = sx0 / k, sy0 / k
-            wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
-            x0p, y0p = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
-            x1p = min(int(math.ceil(wx1)), w)
-            y1p = min(int(math.ceil(wy1)), h)
-            cell_x1 = x1p if c == layout.cols - 1 else min(int(math.ceil((sx0 + layout.step_x) / k)), w)
-            cell_y1 = y1p if r == layout.rows - 1 else min(int(math.ceil((sy0 + layout.step_y) / k)), h)
-            cell_labels = labels[y0p:cell_y1, x0p:cell_x1]
-            cell_regions = regions[y0p:cell_y1, x0p:cell_x1]
-            placed, labeled = place_numbers(cell_labels, cell_regions, px_to_pt, style)
-            masks = []
-            if face_mask is not None:
-                masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
-            if eye_mask is not None:
-                masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
-            if mouth_mask is not None:
-                masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
-            placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, px_to_pt, style, masks)
-            labeled_all |= labeled
-            guide_all |= sheet_guide_region_ids(cell_regions, labeled)
-            for x, y, text, size in placed:
-                placed_all.append((x + x0p, y + y0p, text, size))
-    return placed_all, labeled_all, guide_all
+    return collect_all_placements(labels, regions, layout, job, style, face_mask, eye_mask, mouth_mask)
 
 
 # ---------- PDF pages ----------
@@ -2101,7 +2094,6 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     cell_y1 = y1p if r == layout.rows - 1 else int(math.ceil((sy0 + layout.step_y) / k))
     cell_labels = labels[y0p:cell_y1, x0p:cell_x1]
     cell_regions = regions[y0p:cell_y1, x0p:cell_x1]
-    placed, labeled = place_numbers(cell_labels, cell_regions, k * PT, style)
     masks = []
     if face_mask is not None:
         masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
@@ -2109,16 +2101,21 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
         masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
     if mouth_mask is not None:
         masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
-    placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, k * PT, style, masks)
-    guide_rids = sheet_guide_region_ids(cell_regions, labeled)
+    placements, labeled, guide_rids = place_cell_labels(
+        cell_labels, cell_regions, k * PT, style, job["ppi"], job["scale"], masks,
+    )
     draw_guide_outlines(cv, to_page, cell_regions, guide_rids, style)
+    page_place = [
+        NumberPlacement(
+            p.region_id, p.text, p.size,
+            p.num_x + x0p, p.num_y + y0p,
+            None if p.dot_x is None else p.dot_x + x0p,
+            None if p.dot_y is None else p.dot_y + y0p,
+        )
+        for p in placements
+    ]
+    draw_number_placements(cv, to_page, page_place, style)
     cv.restoreState()
-
-    cv.setFillColor(HexColor("#000000"))
-    for x, y, text, size in placed:
-        px, py = to_page(x + x0p, y + y0p)
-        cv.setFont(style.font, size)
-        cv.drawCentredString(px, py - 0.36 * size, text)
 
     # Registration crosshairs at band centers: corners and edge midpoints, identical in wall coordinates on neighbors.
     cv.setStrokeColor(MARK)
@@ -2628,7 +2625,7 @@ def draw_preview_outlined(path, labels, regions, palette, chunks, layout, job, m
         pts = [(float(x), float(y)) for x, y in chunk]
         draw.line(pts, fill=(0, 0, 0, 210), width=line_w, joint="curve")
 
-    placed, labeled_all, guide_all = collect_placed_numbers(
+    placements, labeled_all, guide_all, _, _ = collect_placed_numbers(
         labels, regions, layout, job, style, face_mask, eye_mask, mouth_mask,
     )
     dash_px = GUIDE_DASH_MM / 25.4 * job["ppi"]
@@ -2637,17 +2634,28 @@ def draw_preview_outlined(path, labels, regions, palette, chunks, layout, job, m
         for pts in region_contour_polylines(regions, rid):
             _draw_dashed_polyline(draw, pts, dash_px, gap_px, fill=(0, 0, 0, 230), width=line_w)
 
-    px_to_pt = k * PT
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     mural_px_per_in = mural_w * job["ppi"] / w
-    for x, y, text, size in placed:
-        pt = max(MIN_LEGIBLE_PT, min(28, size * w / max(mural_w * job["ppi"], 1) * 0.55))
+    line_callout = max(1, int(round(LEADER_LINE_PT * job["ppi"] / 72)))
+    for p in placements:
+        if p.is_callout:
+            draw.line(
+                [(p.dot_x, p.dot_y), (p.num_x, p.num_y)],
+                fill=(60, 60, 60, 220),
+                width=line_callout,
+            )
+            rdot = max(1, line_callout)
+            draw.ellipse(
+                (p.dot_x - rdot, p.dot_y - rdot, p.dot_x + rdot, p.dot_y + rdot),
+                fill=(0, 0, 0, 230),
+            )
+        pt = max(MIN_LEGIBLE_PT, min(28, p.size * w / max(mural_w * job["ppi"], 1) * 0.55))
         try:
             font = ImageFont.truetype(font_path, int(round(pt)))
         except OSError:
             font = ImageFont.load_default()
-        tw, th = draw.textbbox((0, 0), text, font=font)[2:]
-        draw.text((x - tw / 2, y - th / 2), text, fill=(0, 0, 0, 235), font=font)
+        tw, th = draw.textbbox((0, 0), p.text, font=font)[2:]
+        draw.text((p.num_x - tw / 2, p.num_y - th / 2), p.text, fill=(0, 0, 0, 235), font=font)
 
     grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     gdraw = ImageDraw.Draw(grid)
@@ -2689,8 +2697,8 @@ def main():
 
     if getattr(a, "_from_preview_dir", None):
         meta = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text())
-        labels, palette, regions, face_mask, eye_mask, mouth_mask = load_saved_labels(a._from_preview_dir)
-        _, region_colors = label_regions(labels)
+        labels, palette, _regions_saved, face_mask, eye_mask, mouth_mask = load_saved_labels(a._from_preview_dir)
+        regions, region_colors = label_regions(labels)
         ppi = float(meta["ppi"])
         fit_note = meta["fit_note"]
         crop_box = tuple(meta["crop_box"])
@@ -2772,6 +2780,16 @@ def main():
     face_mask = face.get("mask")
     eye_mask = face.get("eye_mask")
     mouth_mask = face.get("mouth_mask")
+    labels, regions, region_colors, merge_info = merge_crowded_regions(
+        labels,
+        palette,
+        ppi,
+        a.scale,
+        style,
+        eye_mask=eye_mask,
+        mouth_mask=mouth_mask,
+        eye_disks_work=face.get("eye_disks_work"),
+    )
 
     wall_sqft = wall_w_in * wall_h_in / 144
     counts = np.bincount(labels.ravel(), minlength=n)
@@ -2812,11 +2830,13 @@ def main():
             for c in range(layout.cols):
                 labeled |= draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
                                       palette, style, face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask)
-        _, _, guide_ids = collect_placed_numbers(
+        _, labeled_ids, guide_ids, inside_ids, callout_ids = collect_placed_numbers(
             labels, regions, layout, job, style, f_mask, e_mask, m_mask,
         )
     else:
         guide_ids = set()
+        inside_ids = set()
+        callout_ids = set()
     cv.save()
 
     preview_samples = []
@@ -2835,7 +2855,7 @@ def main():
             outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style,
             face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask,
         )
-        _, labeled_preview, guide_ids = collect_placed_numbers(
+        _, labeled_preview, guide_ids, inside_ids, callout_ids = collect_placed_numbers(
             labels, regions, layout, job, style, f_mask, e_mask, m_mask,
         )
         pages_dir = a.out / "preview_pages"
@@ -2888,12 +2908,24 @@ def main():
         },
     }
     total_regions = int(regions.max())
+    leg_stats = {
+        "regions_before_merge": merge_info.get("regions_before_merge"),
+        "regions_after_merge": merge_info.get("regions_after_merge"),
+        "merge_steps": merge_info.get("merge_steps"),
+        "palette_colors": n,
+        "colors_used_after_merge": merge_info.get("colors_used"),
+    }
     if a.preview_only:
         summary["numbered_regions"] = len(labeled_preview)
+        summary["numbered_inside"] = len(inside_ids)
+        summary["callout_regions"] = len(callout_ids)
         summary["guide_regions"] = len(guide_ids)
     else:
         summary["numbered_regions"] = len(labeled)
+        summary["numbered_inside"] = len(inside_ids)
+        summary["callout_regions"] = len(callout_ids)
         summary["guide_regions"] = len(guide_ids)
+    summary["legibility"] = leg_stats
     summary["unlabeled_regions"] = summary["guide_regions"]
     if not a.preview_only:
         if getattr(a, "_from_preview_dir", None):
@@ -2909,8 +2941,14 @@ def main():
     print(f"{n} colors ({a.colors} requested), {summary['regions']} regions, "
           f"{sheet_note} {layout.cols}x{layout.rows} {summary['sheets']['orientation']}, "
           f"{pdf_mb:.1f} MB -> {a.out / 'mural.pdf'}")
-    if summary.get("guide_regions"):
-        print(f"guide shapes (no number): {summary['guide_regions']} of {total_regions} regions")
+    leg = summary.get("legibility", {})
+    if leg:
+        print(
+            f"legibility: merged {leg.get('merge_steps', 0)} micro-regions "
+            f"({leg.get('regions_before_merge')} -> {leg.get('regions_after_merge')} regions); "
+            f"inside {summary.get('numbered_inside', 0)}, callouts {summary.get('callout_regions', 0)}, "
+            f"guides {summary.get('guide_regions', 0)}"
+        )
 
 
 if __name__ == "__main__":

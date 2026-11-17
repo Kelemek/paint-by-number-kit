@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import subprocess
 import sys
 from pathlib import Path
 
@@ -16,22 +14,28 @@ from pypdf import PdfReader
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mural_tiler import (  # noqa: E402
-    LABELS_ARCHIVE,
+from legibility_layout import (  # noqa: E402
     MIN_LEGIBLE_PT,
-    PREVIEW_JOB_NAME,
-    STYLES,
     _aabb_overlap,
     _number_aabb_work,
+    _segment_intersects_aabb,
+)
+from mural_tiler import (  # noqa: E402
+    LABELS_ARCHIVE,
+    PREVIEW_JOB_NAME,
+    STYLES,
     choose_layout,
     collect_placed_numbers,
     load_saved_labels,
+    merge_crowded_regions,
+    label_regions,
 )
 
 
 def check_placement(job_dir: Path) -> list[str]:
     meta = json.loads((job_dir / PREVIEW_JOB_NAME).read_text())
-    labels, palette, regions, face_mask, eye_mask, mouth_mask = load_saved_labels(job_dir)
+    labels, palette, _r0, face_mask, eye_mask, mouth_mask = load_saved_labels(job_dir)
+    face = meta.get("subject_priority") or meta.get("face_priority") or {}
     style = STYLES[meta.get("transfer", "trace")]
     job = {
         "wall_w_in": meta["wall_width_ft"] * 12,
@@ -39,48 +43,46 @@ def check_placement(job_dir: Path) -> list[str]:
         "scale": meta.get("scale", 1.0),
         "ppi": meta["ppi"],
     }
+    labels, regions, _, _ = merge_crowded_regions(
+        labels,
+        palette,
+        job["ppi"],
+        job["scale"],
+        style,
+        eye_mask=eye_mask,
+        mouth_mask=mouth_mask,
+        eye_disks_work=face.get("eye_disks_work"),
+    )
     mural_w, mural_h = job["wall_w_in"] * job["scale"], job["wall_h_in"] * job["scale"]
     layout = choose_layout(mural_w, mural_h, meta.get("overlap_in", 0.25))
-    placed, _, _ = collect_placed_numbers(
+    placements, labeled_all, guide_all, inside_all, callout_all = collect_placed_numbers(
         labels, regions, layout, job, style, face_mask, eye_mask, mouth_mask,
     )
     px_to_pt = (job["scale"] / job["ppi"]) * 72.0
     errs = []
     boxes = []
-    for x, y, text, size in placed:
-        if size < MIN_LEGIBLE_PT - 1e-6:
-            errs.append(f"number {text} at ({x:.1f},{y:.1f}) is {size:.2f} pt (< {MIN_LEGIBLE_PT} pt)")
-        box = _number_aabb_work(x, y, text, size, style.font, px_to_pt)
+    for p in placements:
+        if p.size < MIN_LEGIBLE_PT - 1e-6:
+            errs.append(
+                f"number {p.text} for region {p.region_id} is {p.size:.2f} pt (< {MIN_LEGIBLE_PT} pt)"
+            )
+        box = _number_aabb_work(p.num_x, p.num_y, p.text, p.size, style.font, px_to_pt)
         for other in boxes:
             if _aabb_overlap(box, other):
-                errs.append(f"numbers {text} overlaps another at ({x:.1f},{y:.1f})")
+                errs.append(f"number {p.text} overlaps another label")
                 break
+        if p.is_callout:
+            for other in boxes:
+                if _segment_intersects_aabb(p.dot_x, p.dot_y, p.num_x, p.num_y, other):
+                    errs.append(f"leader for {p.text} crosses another number box")
+                    break
+            if p.region_id not in labeled_all:
+                errs.append(f"callout region {p.region_id} not counted as labeled")
         boxes.append(box)
+    for rid in callout_all | inside_all:
+        if rid not in labeled_all:
+            errs.append(f"region {rid} marked placed but missing from labeled set")
     return errs
-
-
-def rasterize_pdf_page(pdf_path: Path, page: int, dpi: int, out_png: Path) -> bool:
-    try:
-        subprocess.run(
-            [
-                "pdftoppm",
-                "-f",
-                str(page),
-                "-l",
-                str(page),
-                "-png",
-                "-r",
-                str(dpi),
-                "-singlefile",
-                str(pdf_path),
-                str(out_png.with_suffix("")),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return out_png.is_file()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
 
 
 def main():
@@ -99,10 +101,9 @@ def main():
         try:
             n_pages = len(PdfReader(str(mural)).pages)
             if n_pages > 0:
-                tmp = job_dir / ".legibility_raster.png"
-                rasterize_pdf_page(mural, 1, args.dpi, tmp)
+                pass
         except Exception as exc:
-            errs.append(f"pdf raster skipped: {exc}")
+            errs.append(f"pdf read skipped: {exc}")
     if errs:
         print("\n".join(errs), file=sys.stderr)
         raise SystemExit(1)
