@@ -312,24 +312,32 @@ def merge_crowded_regions(
         if not tiny:
             break
         tiny.sort(key=lambda rid: areas[rid])
-        rid = tiny[0]
-        sl = ndimage.find_objects(regions)[rid - 1]
-        if sl is None:
+        slices = ndimage.find_objects(regions)
+        merged_this_pass = 0
+        for rid in tiny:
+            if rid >= len(slices):
+                continue
+            sl = slices[rid - 1]
+            if sl is None:
+                continue
+            sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in sl)
+            mask = regions[sl] == rid
+            if not mask.any():
+                continue
+            sub_labels = labels[sl]
+            ring = sub_labels[ndimage.binary_dilation(mask) & ~mask]
+            ring = ring[ring != colors[rid]]
+            if len(ring) == 0:
+                continue
+            neighbor_colors = np.unique(ring)
+            ci = colors[rid]
+            best = min(neighbor_colors, key=lambda c: _lab_dist(palette, ci, int(c)))
+            sub_labels[mask] = best
+            labels[sl] = sub_labels
+            merged += 1
+            merged_this_pass += 1
+        if merged_this_pass == 0:
             break
-        sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in sl)
-        mask = regions[sl] == rid
-        sub_labels = labels[sl]
-        sub_regions = regions[sl]
-        ring = sub_labels[ndimage.binary_dilation(mask) & ~mask]
-        ring = ring[ring != colors[rid]]
-        if len(ring) == 0:
-            break
-        neighbor_colors = np.unique(ring)
-        ci = colors[rid]
-        best = min(neighbor_colors, key=lambda c: _lab_dist(palette, ci, int(c)))
-        sub_labels[mask] = best
-        labels[sl] = sub_labels
-        merged += 1
     regions, colors = label_regions(labels)
     post_count = int(regions.max())
     colors_used = len(np.unique(labels))
