@@ -9,10 +9,11 @@ same inputs always produce the same files.
 Needs Python 3.10+ and poppler-utils (`pdftoppm`/`pdfinfo`/`pdftotext`, used only for checking output).
 
 ```bash
-python3 -m pip install --user --break-system-packages pillow numpy scipy scikit-learn reportlab pypdf
+python3 -m pip install --user --break-system-packages -r ~/mural-kit/requirements.txt
 ```
 
-Tested with Pillow 13.0, numpy 2.5.4, scipy 1.18.1, scikit-learn 1.9.1, reportlab 5.1.0 and pypdf 6.21.0.
+Dependency versions in `requirements.txt` are pinned on purpose for safety and are bumped deliberately.
+Tested on Python 3.13 with Pillow 13.0.0, numpy 2.5.4, scipy 1.18.1, scikit-learn 1.9.1, reportlab 5.1.0, pypdf 6.21.0, and opencv-python-headless 5.0.0.93.
 Drop `--break-system-packages` on systems without PEP 668 (or use a venv).
 
 ## Files
