@@ -39,6 +39,12 @@ from scipy import ndimage
 from sklearn.cluster import KMeans
 
 PT = 72.0                 # PDF points per inch
+MM = PT / 25.4
+GUIDE_DASH_PT = 1.5 * MM
+GUIDE_GAP_PT = 1.0 * MM
+GUIDE_STROKE_PT = 0.75
+EYE_LSTAR_GAP_MIN = 15.0
+KITTEN_TEST_IMAGE = "kitten_ragdoll_canvas.jpg"
 PRINT_ABS_MIN_PT = 6.0    # numbers on sheets must not render below this (6 pt hard floor)
 MARGIN = 0.25             # printer-safe page margin, inches
 HEADER, FOOTER = 0.25, 0.45
@@ -1249,6 +1255,196 @@ def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, mouth_mask=Non
     return _assign_nearest_lab(orig, centers)
 
 
+def paint_for_main_outlines(labels, regions, numbered_ids, eye_mask=None):
+    """Paint numbered regions (plus all eye subregions) so guide-guide mesh stays off main sheets."""
+    paint = np.zeros(labels.shape, dtype=np.int32)
+    rids = {int(r) for r in numbered_ids}
+    if eye_mask is not None and float(np.max(eye_mask)) >= 0.25:
+        em = eye_mask >= 0.45
+        for rid in np.unique(regions[em]):
+            rid = int(rid)
+            if rid > 0:
+                rids.add(rid)
+    for rid in rids:
+        m = regions == int(rid)
+        if np.any(m):
+            paint[m] = int(labels[m][0]) + 1
+    return paint
+
+
+def promote_eye_regions_to_numbered(numbered, guide, speck, regions, eye_mask, min_px=5):
+    """Eye subregions must stay numbered on main sheets (pupil/iris/catchlight)."""
+    if eye_mask is None or float(np.max(eye_mask)) < 0.25:
+        return numbered, guide, speck
+    numbered, guide, speck = set(numbered), set(guide), set(speck)
+    em = eye_mask >= 0.45
+    for rid in list(guide | speck):
+        m = (regions == int(rid)) & em
+        if int(m.sum()) >= min_px:
+            numbered.add(int(rid))
+            guide.discard(int(rid))
+            speck.discard(int(rid))
+    return numbered, guide, speck
+
+
+def merge_micro_regions_in_mask(labels, rgb, region_mask, max_area_px=12, max_passes=25, protect_mask=None):
+    """Merge dust regions inside region_mask into the best Lab neighbor (not in protect_mask)."""
+    if region_mask is None or not np.any(region_mask):
+        return labels
+    protect_mask = protect_mask if protect_mask is not None else np.zeros(labels.shape, dtype=bool)
+    roi = region_mask.astype(bool) & ~protect_mask
+    if not np.any(roi):
+        return labels
+    for _ in range(max_passes):
+        regions, colors = label_regions(labels)
+        ids = np.arange(1, len(colors))
+        area = np.bincount(regions.ravel(), minlength=len(colors))[1:]
+        changed = False
+        slices = ndimage.find_objects(regions)
+        for rid in ids[(area < max_area_px) & (area > 0)]:
+            mrid = regions == rid
+            if not np.any(mrid & roi):
+                continue
+            if np.any(mrid & protect_mask):
+                continue
+            sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in slices[rid - 1])
+            mask = regions[sl] == rid
+            sub = labels[sl]
+            ring = sub[ndimage.binary_dilation(mask) & ~mask]
+            ring = ring[ring != colors[rid]]
+            if len(ring):
+                sub[mask] = int(np.bincount(ring).argmax())
+                changed = True
+        if not changed:
+            break
+    return labels
+
+
+def enforce_eye_label_structure(labels, rgb, palette, eye_mask, min_lstar_gap=EYE_LSTAR_GAP_MIN):
+    """Final eye pass: >=3 labels per eye with pupil dark enough vs iris (survives to labels.npz)."""
+    if eye_mask is None or float(eye_mask.max()) < 0.25:
+        return labels, palette
+    out = labels.copy()
+    pal_lab = rgb_to_lab(palette).astype(np.float64)
+    pix_lab = rgb_to_lab(rgb)
+    luma = pix_lab[..., 0]
+    em = eye_mask >= 0.45
+    if not np.any(em):
+        return out, palette
+    order = np.argsort(pal_lab[:, 0], kind="stable")
+    dark_idx = int(order[0])
+    mid_idx = int(order[len(order) // 2])
+    catch_idx = int(order[-2]) if len(order) >= 3 else int(order[-1])
+    if catch_idx == dark_idx or catch_idx == mid_idx:
+        catch_idx = int(order[-1])
+    extra = int(order[1]) if len(order) > 3 else mid_idx
+    slot_map = [dark_idx, extra, mid_idx, catch_idx]
+    cc, n_cc = ndimage.label(em)
+    for ci in range(1, n_cc + 1):
+        m = cc == ci
+        if int(m.sum()) < 20:
+            continue
+        lv = luma[m].astype(np.float64)
+        if int(m.sum()) >= 48:
+            km = KMeans(n_clusters=3, n_init=4, random_state=SEED).fit(lv.reshape(-1, 1))
+            centers = km.cluster_centers_.ravel()
+            order = np.argsort(centers)
+            slots = [dark_idx, mid_idx, catch_idx]
+            for ki, cl in enumerate(order):
+                zm = m.copy()
+                zm[m] = km.labels_ == cl
+                if int(zm.sum()) >= 2:
+                    out[zm] = int(slots[ki])
+            lids_here = {int(v) for v in np.unique(out[m]) if int(v) > 0}
+            if len(lids_here) < 3:
+                t_dark, t_light = np.percentile(lv, [34, 76])
+                out[m & (luma <= t_dark)] = int(dark_idx)
+                out[m & (luma > t_dark) & (luma < t_light)] = int(mid_idx)
+                out[m & (luma >= t_light)] = int(catch_idx)
+                if int((m & (out == catch_idx)).sum()) < 4:
+                    t_hi = np.percentile(lv, 90)
+                    out[m & (luma >= t_hi)] = int(catch_idx)
+        else:
+            t0, t1, t2 = np.percentile(lv, [22, 52, 84])
+            zones = (
+                (m & (luma <= t0), slot_map[0]),
+                (m & (luma > t0) & (luma <= t1), slot_map[1]),
+                (m & (luma > t1) & (luma < t2), slot_map[2]),
+                (m & (luma >= t2), slot_map[3]),
+            )
+            for zm, lid in zones:
+                if int(zm.sum()) >= 2:
+                    out[zm] = int(lid)
+        holes = m & (out == 0)
+        if np.any(holes):
+            out[holes] = int(mid_idx)
+    # Nudge palette L* so preview and test see pupil vs iris gap.
+    for ci in range(1, n_cc + 1):
+        m = cc == ci
+        pupil = m & (out == dark_idx)
+        iris = m & (out == mid_idx)
+        if int(pupil.sum()) < 2 or int(iris.sum()) < 2:
+            continue
+        iris_l = float(pix_lab[iris, 0].mean())
+        pupil_l = float(pix_lab[pupil, 0].mean())
+        pal_lab[mid_idx, 0] = max(pal_lab[mid_idx, 0], iris_l)
+        pal_lab[dark_idx, 0] = min(pal_lab[dark_idx, 0], pupil_l)
+        if pal_lab[mid_idx, 0] - pal_lab[dark_idx, 0] < min_lstar_gap:
+            pal_lab[dark_idx, 0] = pal_lab[mid_idx, 0] - min_lstar_gap
+        if int((m & (out == catch_idx)).sum()) >= 2:
+            catch_l = float(pix_lab[m & (out == catch_idx), 0].mean())
+            pal_lab[catch_idx, 0] = max(pal_lab[catch_idx, 0], catch_l)
+    palette = lab_to_rgb(pal_lab)
+    return out, palette
+
+
+def finalize_face_labels(labels, rgb, palette, face, ppi):
+    """Last label mutations before labels.npz: mouth micro-merge + enforced eye structure."""
+    eye = face.get("eye_mask")
+    mouth = face.get("mouth_mask")
+    protect = (eye >= 0.45) if eye is not None else np.zeros(labels.shape, dtype=bool)
+    face = face.get("mask") if isinstance(face, dict) else None
+    face_m = (face >= 0.35) if face is not None and float(np.max(face)) >= 0.2 else None
+    merge_mask = None
+    if mouth is not None and float(np.max(mouth)) >= 0.2:
+        merge_mask = mouth >= 0.35
+    if face_m is not None:
+        merge_mask = face_m if merge_mask is None else (merge_mask | face_m)
+    if merge_mask is not None and np.any(merge_mask):
+        labels = merge_micro_regions_in_mask(
+            labels, rgb, merge_mask, max_area_px=22, protect_mask=protect,
+        )
+    labels, palette = enforce_eye_label_structure(labels, rgb, palette, eye)
+    return labels, palette
+
+
+def work_rgb_from_job_meta(meta, wall_w_in, wall_h_in):
+    argv = meta.get("argv") or {}
+    img_path = argv.get("image")
+    if not img_path or not Path(img_path).exists():
+        return None
+    src = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
+    src = apply_image_prep(src, meta.get("prep") or argv.get("prep") or "none")
+    ppi = float(meta["ppi"])
+    img, _, _ = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
+    return np.asarray(img)
+
+
+def is_kitten_canvas_regression(a):
+    img = getattr(a, "image", None)
+    if img is None:
+        argv = getattr(a, "_from_preview_dir", None)
+        if argv:
+            meta = json.loads((Path(argv) / PREVIEW_JOB_NAME).read_text())
+            img = meta.get("argv", {}).get("image", "")
+    name = Path(str(img or "")).name
+    if name != KITTEN_TEST_IMAGE:
+        return False
+    w = getattr(a, "wall_width_ft", None)
+    h = getattr(a, "wall_height_ft", None)
+    return w is not None and h is not None and is_canvas_job(w, h)
+
+
 def sharpen_eye_features(labels, rgb, eye_mask, ppi):
     """Split each eye into pupil, rim, iris, and catchlight using local luminance (keep separate labels)."""
     if eye_mask is None or float(eye_mask.max()) < 0.35:
@@ -1691,8 +1887,8 @@ def draw_guide_paths(cv, chunks, closed_flags, to_page_fn, line_pt):
         return
     cv.saveState()
     cv.setStrokeColor(HexColor("#444444"))
-    cv.setLineWidth(max(0.4, line_pt * 0.55))
-    cv.setDash(4, 2.5)
+    cv.setLineWidth(max(GUIDE_STROKE_PT, line_pt * 0.85))
+    cv.setDash(GUIDE_DASH_PT, GUIDE_GAP_PT)
     for ch, closed in zip(chunks, closed_flags):
         path = cv.beginPath()
         pts = [(float(x), float(y)) for x, y in ch]
@@ -1797,7 +1993,10 @@ def render_work_box_sheet_preview(
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     line_w = max(1, int(round(style.line_pt * 2)))
-    for chunk in trace_boundaries(crop_l, sigma=sigma * 0.9, keep_every=2):
+    gset = {int(r) for r in (guide_ids or [])}
+    crop_numbered = {int(r) for r in np.unique(crop_r) if int(r) > 0 and int(r) not in gset}
+    outline_paint = paint_for_main_outlines(crop_l, crop_r, crop_numbered, eye_mask=None)
+    for chunk in trace_boundaries(outline_paint, sigma=sigma * 0.9, keep_every=2):
         pts = [(float(px), float(py)) for px, py in chunk]
         draw.line(pts, fill=(0, 0, 0, 220), width=line_w, joint="curve")
     if guide_ids:
@@ -2629,7 +2828,7 @@ def neighbor_tag(cv, x, y, text, direction):
         cv.drawString(x + 6, y - 2.5, text)
 
 
-def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma, guide_ids=None):
+def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma, guide_ids=None, numbered_ids=None):
     """Enlarged reference page for a focal clump (not wall-size)."""
     page = letter
     cv.setPageSize(page)
@@ -2638,7 +2837,13 @@ def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma, gu
     thumb_gap = 0.25 * PT
     thumb_col = thumb_w + thumb_gap
     left, bottom = MARGIN * PT, (MARGIN + FOOTER) * PT
-    cw, ch = pw - 2 * MARGIN * PT - thumb_col, ph - 2 * MARGIN * PT - HEADER * PT - FOOTER * PT
+    cw = pw - 2 * MARGIN * PT - thumb_col
+    content_top = ph - MARGIN * PT - HEADER * PT - 4
+    header_block = 46
+    header_bottom = content_top - header_block
+    header_gap = 8
+    art_top = header_bottom - header_gap
+    art_h = max(48.0, art_top - bottom)
     x0, y0, x1, y1 = (int(v) for v in inset["box"])
     crop_labels = labels[y0:y1, x0:x1]
     crop_regions = regions[y0:y1, x0:x1]
@@ -2647,14 +2852,16 @@ def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma, gu
     k_draw = k_base * max(mag, 1.0)
     wall_w_px, wall_h_px = x1 - x0, y1 - y0
     tile_w_in, tile_h_in = wall_w_px * k_draw, wall_h_px * k_draw
-    s_fit = min(cw / (tile_w_in * PT), ch / (tile_h_in * PT))
+    s_fit = min(cw / (tile_w_in * PT), art_h / (tile_h_in * PT))
     cw_use, ch_use = tile_w_in * PT * s_fit, tile_h_in * PT * s_fit
-    top = bottom + ch_use
+    left_art = left + max(0.0, (cw - cw_use) * 0.5)
+    art_bottom = max(bottom, art_top - ch_use)
     did = inset["id"]
     guide_ids = guide_ids or set()
+    numbered_ids = numbered_ids or set()
 
     def to_page(lx, ly):
-        return left + lx * k_draw * PT * s_fit, top - ly * k_draw * PT * s_fit
+        return left_art + lx * k_draw * PT * s_fit, art_bottom + ch_use - ly * k_draw * PT * s_fit
 
     tint = float(job.get("sheet_tint", 0.12))
     tile = palette[crop_labels]
@@ -2662,9 +2869,11 @@ def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma, gu
     buf = BytesIO()
     Image.fromarray(faded).save(buf, format="PNG")
     buf.seek(0)
-    cv.drawImage(ImageReader(buf), left, bottom, cw_use, ch_use, preserveAspectRatio=False, anchor="sw")
+    cv.drawImage(ImageReader(buf), left_art, art_bottom, cw_use, ch_use, preserveAspectRatio=False, anchor="sw")
 
-    lines = trace_boundaries(crop_labels, sigma=sigma * 0.95)
+    crop_numbered = {int(r) for r in np.unique(crop_regions) if int(r) in numbered_ids}
+    outline_paint = paint_for_main_outlines(crop_labels, crop_regions, crop_numbered)
+    lines = trace_boundaries(outline_paint, sigma=sigma * 0.95)
     cv.saveState()
     clip = cv.beginPath()
     clip.rect(left, bottom, cw_use, ch_use)
@@ -2708,19 +2917,19 @@ def draw_detail_sheet(cv, job, inset, labels, regions, palette, style, sigma, gu
     cv.drawImage(ImageReader(tbuf), thumb_x, bottom + 6, thumb_w, thumb_h)
 
     cv.setFillColor(HexColor("#000000"))
-    hy = bottom + ch_use + 8
+    hy = content_top - 12
     title = (
         f"Detail {did}  ·  {mag:g}× enlarged reference for "
         f"{inset['wall_w_in']:.2f}×{inset['wall_h_in']:.2f} in on the wall  ·  NOT wall-size"
     )
-    cv.setFont("Helvetica-Bold", fit_text(title, "Helvetica-Bold", 11, cw_use))
+    cv.setFont("Helvetica-Bold", fit_text(title, "Helvetica-Bold", 11, cw))
     cv.drawString(left, hy, title)
     cv.setFont("Helvetica", 10)
     note = (
         f"Dashed shapes still too small stay unnumbered ({max(0, len(guide_in_crop) - len(newly_on_d1))} here); "
         f"{len(newly_on_d1)} guide shape(s) now show a number at this enlargement."
     )
-    for i, line in enumerate(wrap_lines(note, "Helvetica", 10, cw_use)[:2]):
+    for i, line in enumerate(wrap_lines(note, "Helvetica", 10, cw)[:2]):
         cv.drawString(left, hy - 14 - i * 12, line)
     cv.showPage()
     inset["guides_numbered_on_detail"] = len(newly_on_d1)
@@ -3209,6 +3418,9 @@ def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, m
 def ensure_full_mural_pdf(job_dir, tiler_path=None):
     """Run --from-preview into job_dir/full so mural.pdf contains every numbered sheet."""
     job_dir = Path(job_dir)
+    direct = job_dir / "mural.pdf"
+    if direct.is_file():
+        return direct
     full = job_dir / "full"
     pdf = full / "mural.pdf"
     if pdf.is_file():
@@ -3428,11 +3640,13 @@ def main():
     resolved = {"detail": a.detail, "prep": a.prep}
     crop_box = (0, 0, 0, 0)
 
+    work_rgb = None
     if getattr(a, "_from_preview_dir", None):
         meta = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text())
         labels, palette, regions, face_mask, eye_mask, mouth_mask = load_saved_labels(a._from_preview_dir)
         _, region_colors = label_regions(labels)
         ppi = float(meta["ppi"])
+        work_rgb = work_rgb_from_job_meta(meta, wall_w_in, wall_h_in)
         fit_note = meta["fit_note"]
         crop_box = tuple(meta["crop_box"])
         face = dict(meta.get("subject_priority") or meta["face_priority"])
@@ -3457,6 +3671,7 @@ def main():
         img, fit_note, crop_box = fit_to_wall(src, wall_w_in, wall_h_in, ppi)
         resolved["fit_note"] = fit_note
         rgb = np.asarray(img)
+        work_rgb = rgb
         face = resolve_subject(src, img, crop_box, a)
         merge_min = lab_merge_min_dist(a.detail, a.colors, a.wall_width_ft, a.wall_height_ft)
         if face["mask"] is not None:
@@ -3533,6 +3748,7 @@ def main():
         labels, palette = finalize_palette(
             labels, rgb, face.get("eye_mask"), face.get("mouth_mask"), face.get("mask"),
         )
+        labels, palette = finalize_face_labels(labels, rgb, palette, face, ppi)
         regions, region_colors = label_regions(labels)
         numbered_ids, guide_ids, speck_ids = classify_placement_regions(
             regions, labels, style, px_to_pt_floor, ppi, min_guide_in,
@@ -3547,6 +3763,9 @@ def main():
     k_sheet = a.scale / ppi
     numbered_ids, guide_ids, speck_ids = classify_placement_regions(
         regions, labels, style, px_to_pt_floor, ppi, min_guide_in, a.min_region_in,
+    )
+    numbered_ids, guide_ids, speck_ids = promote_eye_regions_to_numbered(
+        numbered_ids, guide_ids, speck_ids, regions, eye_mask,
     )
     outline_guide_ids = guide_ids | speck_ids
     if getattr(a, "_from_preview_dir", None):
@@ -3601,6 +3820,12 @@ def main():
         regions, outline_guide_ids, sigma, ppi=ppi,
     )
     skip_number_regions = set(outline_guide_ids)
+    if eye_mask is not None:
+        em = eye_mask >= 0.45
+        for rid in np.unique(regions[em]):
+            rid = int(rid)
+            if rid > 0:
+                skip_number_regions.discard(rid)
     d1_guides_numbered = 0
 
     if a.soup_report and not getattr(a, "_from_preview_dir", None):
@@ -3631,7 +3856,8 @@ def main():
     draw_map(cv, job, small, layout, mural_w, mural_h, detail_insets=detail_insets)
     front_pages = cover_pages + key_pages + instr_pages + 1
     labeled = set()
-    chunks, boxes = chunk_polylines(trace_boundaries(labels, sigma=sigma))
+    outline_paint = paint_for_main_outlines(labels, regions, numbered_ids, eye_mask=eye_mask)
+    chunks, boxes = chunk_polylines(trace_boundaries(outline_paint, sigma=sigma))
     f_mask, e_mask, m_mask = face_mask, eye_mask, mouth_mask
     if not a.preview_only:
         for r in range(layout.rows):
@@ -3644,7 +3870,8 @@ def main():
                 )
         for ins in detail_insets or []:
             _labeled, newly = draw_detail_sheet(
-                cv, job, ins, labels, regions, palette, style, sigma, guide_ids=outline_guide_ids,
+                cv, job, ins, labels, regions, palette, style, sigma,
+                guide_ids=outline_guide_ids, numbered_ids=numbered_ids,
             )
             labeled |= _labeled
             d1_guides_numbered += len(newly)
@@ -3745,6 +3972,24 @@ def main():
         print(f"warning: {summary['unlabeled_regions']} regions got no number on any sheet")
     if summary.get("guide_regions"):
         print(f"freehand guide shapes: {summary['guide_regions']} regions (dashed, unnumbered)")
+
+    if is_kitten_canvas_regression(a) and work_rgb is not None:
+        try:
+            from scripts.kitten_kit_tests import validate_eye_labels
+
+            eye_res = validate_eye_labels(labels, palette, eye_mask, work_rgb)
+            print(f"kitten eye gate: OK ({eye_res})")
+        except AssertionError as exc:
+            raise SystemExit(f"kitten eye gate FAILED: {exc}") from exc
+        if not a.preview_only and (a.out / "mural.pdf").is_file():
+            try:
+                from scripts.kitten_kit_tests import run_from_out_dir
+
+                prev = getattr(a, "_from_preview_dir", None) or a.out
+                gate = run_from_out_dir(a.out, render_a1=True, preview_dir=prev)
+                print(f"kitten kit gate: {json.dumps(gate)}")
+            except AssertionError as exc:
+                raise SystemExit(f"kitten kit gate FAILED: {exc}") from exc
 
 
 if __name__ == "__main__":
