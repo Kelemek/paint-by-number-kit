@@ -78,6 +78,12 @@ PREVIEW_JOB_VERSION = 1
 TRACE_SIGMA_FRAC = 0.10   # cap smoothing vs smallest paintable feature
 PREVIEW_JOB_NAME = "preview_job.json"
 LABELS_ARCHIVE = "labels.npz"
+MIN_LEGIBLE_PT = 6.0
+GUIDE_DASH_MM = 1.5
+GUIDE_GAP_MM = 1.0
+GUIDE_FOOTER_LEGEND = (
+    "Dashed shape = no number, paint freehand to match its neighbors (see color picture)."
+)
 
 
 @dataclass(frozen=True)
@@ -1549,8 +1555,39 @@ def feet_inches(inches):
 
 # ---------- per-sheet number placement ----------
 
+def max_fit_number_pt(radius, text, px_to_pt, style):
+    """Largest type size that fits the inscribed circle (same margin rule as legacy placement)."""
+    if radius <= 0:
+        return 0.0
+    half_diag = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
+    return min(style.max_pt, 0.85 * radius * px_to_pt / half_diag)
+
+
+def legible_number_pt(radius, text, px_to_pt, style):
+    """Return type size when the region can hold at least MIN_LEGIBLE_PT, else None."""
+    fit = max_fit_number_pt(radius, text, px_to_pt, style)
+    if fit < MIN_LEGIBLE_PT:
+        return None
+    return min(style.max_pt, max(MIN_LEGIBLE_PT, fit))
+
+
+def _number_aabb_work(x, y, text, size, font, px_to_pt):
+    hw = stringWidth(text, font, size) / 2 / px_to_pt
+    hh = (0.36 * size) / px_to_pt
+    return x - hw, y - hh, x + hw, y + hh
+
+
+def _aabb_overlap(a, b, pad=0.35):
+    return not (a[2] + pad < b[0] or b[2] + pad < a[0] or a[3] + pad < b[1] or b[3] + pad < a[1])
+
+
+def _placement_overlaps(placed, x, y, text, size, px_to_pt, style):
+  boxes = [_number_aabb_work(px, py, t, sz, style.font, px_to_pt) for px, py, t, sz in placed]
+  return any(_aabb_overlap(box, _number_aabb_work(x, y, text, size, style.font, px_to_pt)) for box in boxes)
+
+
 def place_numbers(crop, crop_regions, px_to_pt, style):
-    """One number per same-color piece inside the crop, at its most interior point. Returns (labels, region ids labeled)."""
+    """One number per same-color piece when it can hold MIN_LEGIBLE_PT without overlapping others."""
     dist = interior_distance(crop)
     placed, labeled = [], set()
     for k in np.unique(crop):
@@ -1561,19 +1598,20 @@ def place_numbers(crop, crop_regions, px_to_pt, style):
         radii = ndimage.maximum(dist, comp, idx)
         spots = ndimage.maximum_position(dist, comp, idx)
         text = str(k + 1)
-        half_diag = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
         for radius, (y, x) in zip(radii, spots):
-            # Always place a number so no region is left unlabeled. Tiny face details
-            # may get type as small as 4.5 pt when they can't hold the usual minimum.
-            raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else 4.5
-            size = min(style.max_pt, max(4.5, raw))
-            placed.append((x + 0.5, y + 0.5, text, size))
+            size = legible_number_pt(float(radius), text, px_to_pt, style)
+            if size is None:
+                continue
+            xw, yw = x + 0.5, y + 0.5
+            if _placement_overlaps(placed, xw, yw, text, size, px_to_pt, style):
+                continue
+            placed.append((xw, yw, text, size))
             labeled.add(int(crop_regions[y, x]))
     return placed, labeled
 
 
 def complete_priority_labels(placed, labeled, crop, crop_regions, px_to_pt, style, masks):
-    """Every region touching a priority mask (face/eye) gets a number on the sheet."""
+    """Try to number priority-mask regions that were skipped, with the same legibility rules."""
     if not masks:
         return placed, labeled
     dist = interior_distance(crop)
@@ -1594,15 +1632,101 @@ def complete_priority_labels(placed, labeled, crop, crop_regions, px_to_pt, styl
             continue
         k = int(crop[m][0])
         text = str(k + 1)
-        half_diag = math.hypot(stringWidth(text, style.font, 1), 0.72) / 2
         sub = np.where(m, dist, 0)
         cy, cx = np.unravel_index(sub.argmax(), sub.shape)
         radius = float(dist[cy, cx])
-        raw = 0.85 * radius * px_to_pt / half_diag if radius > 0 else style.min_pt
-        size = min(style.max_pt, max(4.5, raw))
+        size = legible_number_pt(radius, text, px_to_pt, style)
+        if size is None or _placement_overlaps(placed, cx + 0.5, cy + 0.5, text, size, px_to_pt, style):
+            continue
         placed.append((cx + 0.5, cy + 0.5, text, size))
         labeled.add(rid)
     return placed, labeled
+
+
+def _guide_dash_pts():
+    mm = PT / 25.4
+    return GUIDE_DASH_MM * mm, GUIDE_GAP_MM * mm
+
+
+def region_contour_polylines(region_map, rid):
+    """Closed polylines tracing one region id (work-pixel coordinates)."""
+    import cv2
+
+    mask = (region_map == rid).astype(np.uint8)
+    if mask.sum() == 0:
+        return []
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for cnt in contours:
+        if len(cnt) < 3:
+            continue
+        pts = [(float(p[0][0]), float(p[0][1])) for p in cnt]
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
+        out.append(pts)
+    return out
+
+
+def draw_guide_outlines(cv, to_page, region_map, guide_rids, style):
+    if not guide_rids:
+        return
+    dash, gap = _guide_dash_pts()
+    cv.setDash(dash, gap)
+    cv.setStrokeGray(style.line_gray)
+    cv.setLineWidth(style.line_pt)
+    cv.setLineJoin(1)
+    cv.setLineCap(0)
+    for rid in sorted(guide_rids):
+        for pts in region_contour_polylines(region_map, rid):
+            path = cv.beginPath()
+            path.moveTo(*to_page(*pts[0]))
+            for x, y in pts[1:]:
+                path.lineTo(*to_page(x, y))
+            cv.drawPath(path, stroke=1, fill=0)
+    cv.setDash()
+
+
+def sheet_guide_region_ids(cell_regions, labeled):
+    ids = {int(r) for r in np.unique(cell_regions) if r > 0}
+    return ids - labeled
+
+
+def collect_placed_numbers(labels, regions, layout, job, style, face_mask=None, eye_mask=None, mouth_mask=None):
+    """Same placement as draw_sheet cells — for parity checks and preview PNG."""
+    k = job["scale"] / job["ppi"]
+    mural_w = job["wall_w_in"] * job["scale"]
+    mural_h = job["wall_h_in"] * job["scale"]
+    px_to_pt = k * PT
+    placed_all = []
+    labeled_all = set()
+    guide_all = set()
+    h, w = labels.shape
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            sx0, sy0 = c * layout.step_x, r * layout.step_y
+            wx0, wy0 = sx0 / k, sy0 / k
+            wx1, wy1 = (sx0 + layout.cw) / k, (sy0 + layout.ch) / k
+            x0p, y0p = max(0, int(math.floor(wx0))), max(0, int(math.floor(wy0)))
+            x1p = min(int(math.ceil(wx1)), w)
+            y1p = min(int(math.ceil(wy1)), h)
+            cell_x1 = x1p if c == layout.cols - 1 else min(int(math.ceil((sx0 + layout.step_x) / k)), w)
+            cell_y1 = y1p if r == layout.rows - 1 else min(int(math.ceil((sy0 + layout.step_y) / k)), h)
+            cell_labels = labels[y0p:cell_y1, x0p:cell_x1]
+            cell_regions = regions[y0p:cell_y1, x0p:cell_x1]
+            placed, labeled = place_numbers(cell_labels, cell_regions, px_to_pt, style)
+            masks = []
+            if face_mask is not None:
+                masks.append(face_mask[y0p:cell_y1, x0p:cell_x1])
+            if eye_mask is not None:
+                masks.append(eye_mask[y0p:cell_y1, x0p:cell_x1])
+            if mouth_mask is not None:
+                masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
+            placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, px_to_pt, style, masks)
+            labeled_all |= labeled
+            guide_all |= sheet_guide_region_ids(cell_regions, labeled)
+            for x, y, text, size in placed:
+                placed_all.append((x + x0p, y + y0p, text, size))
+    return placed_all, labeled_all, guide_all
 
 
 # ---------- PDF pages ----------
@@ -1967,7 +2091,6 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     cv.setStrokeColor(HexColor("#000000"))
     cv.setLineWidth(max(style.line_pt, 1.2))
     cv.rect(left - sx0 * PT, top - mural_h * PT + sy0 * PT, mural_w * PT, mural_h * PT, stroke=1, fill=0)
-    cv.restoreState()
 
     # Color numbers go only in this sheet's map cell (tile minus the right/bottom bands). Later sheets are
     # taped over those bands, so every spot on the wall gets its number from exactly one visible sheet.
@@ -1987,6 +2110,10 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     if mouth_mask is not None:
         masks.append(mouth_mask[y0p:cell_y1, x0p:cell_x1])
     placed, labeled = complete_priority_labels(placed, labeled, cell_labels, cell_regions, k * PT, style, masks)
+    guide_rids = sheet_guide_region_ids(cell_regions, labeled)
+    draw_guide_outlines(cv, to_page, cell_regions, guide_rids, style)
+    cv.restoreState()
+
     cv.setFillColor(HexColor("#000000"))
     for x, y, text, size in placed:
         px, py = to_page(x + x0p, y + y0p)
@@ -2067,6 +2194,8 @@ def draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, r
     cv.setFillColor(HexColor("#000000"))
     cv.setFont("Helvetica", 6)
     cv.drawRightString(gx - 3, fy + 1, "you are here")
+    cv.setFont("Helvetica-Oblique", 5.5)
+    cv.drawString(left, fy + 26, GUIDE_FOOTER_LEGEND)
     cv.showPage()
     return labeled
 
@@ -2287,38 +2416,52 @@ def ensure_full_mural_pdf(job_dir, tiler_path=None):
 
 
 def rasterize_pdf_page(pdf_path, page_num, dpi=144):
-    """Rasterize one 1-based PDF page to an RGB PIL image; None if pdftoppm missing."""
+    """Rasterize one 1-based PDF page to an RGB PIL image; None if no raster backend."""
     pdf_path = Path(pdf_path)
-    if not pdf_path.is_file() or shutil.which("pdftoppm") is None:
+    if not pdf_path.is_file():
         return None
-    import tempfile
+    if shutil.which("pdftoppm") is not None:
+        import tempfile
 
-    with tempfile.TemporaryDirectory() as td:
-        prefix = Path(td) / "page"
-        try:
-            subprocess.run(
-                [
-                    "pdftoppm",
-                    "-png",
-                    "-r",
-                    str(dpi),
-                    "-f",
-                    str(page_num),
-                    "-l",
-                    str(page_num),
-                    str(pdf_path),
-                    str(prefix),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError:
-            return None
-        hits = sorted(Path(td).glob("page-*.png"))
-        if not hits:
-            return None
-        return Image.open(hits[0]).convert("RGB")
+        with tempfile.TemporaryDirectory() as td:
+            prefix = Path(td) / "page"
+            try:
+                subprocess.run(
+                    [
+                        "pdftoppm",
+                        "-png",
+                        "-r",
+                        str(dpi),
+                        "-f",
+                        str(page_num),
+                        "-l",
+                        str(page_num),
+                        str(pdf_path),
+                        str(prefix),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError:
+                return None
+            hits = sorted(Path(td).glob("page-*.png"))
+            if not hits:
+                return None
+            return Image.open(hits[0]).convert("RGB")
+    try:
+        import pymupdf
+    except ImportError:
+        return None
+    doc = pymupdf.open(pdf_path)
+    idx = page_num - 1
+    if idx < 0 or idx >= doc.page_count:
+        doc.close()
+        return None
+    scale = dpi / PT
+    pix = doc[idx].get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+    doc.close()
+    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
 
 def _front_pages_for_full_build(job_dir):
@@ -2428,7 +2571,51 @@ def _outline_font(style):
         return ImageFont.load_default()
 
 
-def draw_preview_outlined(path, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style):
+def _draw_dashed_polyline(draw, pts, dash_px, gap_px, **kwargs):
+    if len(pts) < 2:
+        return
+    total = 0.0
+    segs = []
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            continue
+        segs.append((x0, y0, dx / length, dy / length, length))
+        total += length
+    if total < 1e-6:
+        return
+    pos = 0.0
+    drawing = True
+    while pos < total:
+        remain = dash_px if drawing else gap_px
+        used = 0.0
+        start = pos
+        end = min(pos + remain, total)
+        x0 = y0 = x1 = y1 = None
+        for x, y, ux, uy, length in segs:
+            s0, s1 = used, used + length
+            if end <= s0 or start >= s1:
+                used += length
+                continue
+            a = max(start, s0) - s0
+            b = min(end, s1) - s0
+            px0, py0 = x + ux * a, y + uy * a
+            px1, py1 = x + ux * b, y + uy * b
+            if x0 is None:
+                x0, y0 = px0, py0
+            x1, y1 = px1, py1
+            used += length
+        if drawing and x0 is not None:
+            draw.line([(x0, y0), (x1, y1)], **kwargs)
+        pos = end
+        drawing = not drawing
+
+
+def draw_preview_outlined(path, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style,
+                          face_mask=None, eye_mask=None, mouth_mask=None):
     """Whole-mural PNG with fills, vector boundaries, numbers, and a faint sheet grid."""
     h, w = labels.shape
     k = job["scale"] / job["ppi"]
@@ -2441,11 +2628,20 @@ def draw_preview_outlined(path, labels, regions, palette, chunks, layout, job, m
         pts = [(float(x), float(y)) for x, y in chunk]
         draw.line(pts, fill=(0, 0, 0, 210), width=line_w, joint="curve")
 
-    px_to_pt = k * PT * (w / max(mural_w * job["ppi"], 1))  # match sheet number sizing at mural width
-    placed, _ = place_numbers(labels, regions, px_to_pt, style)
+    placed, labeled_all, guide_all = collect_placed_numbers(
+        labels, regions, layout, job, style, face_mask, eye_mask, mouth_mask,
+    )
+    dash_px = GUIDE_DASH_MM / 25.4 * job["ppi"]
+    gap_px = GUIDE_GAP_MM / 25.4 * job["ppi"]
+    for rid in guide_all:
+        for pts in region_contour_polylines(regions, rid):
+            _draw_dashed_polyline(draw, pts, dash_px, gap_px, fill=(0, 0, 0, 230), width=line_w)
+
+    px_to_pt = k * PT
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    mural_px_per_in = mural_w * job["ppi"] / w
     for x, y, text, size in placed:
-        pt = max(8, min(28, size * w / max(mural_w * job["ppi"], 1) * 0.55))
+        pt = max(MIN_LEGIBLE_PT, min(28, size * w / max(mural_w * job["ppi"], 1) * 0.55))
         try:
             font = ImageFont.truetype(font_path, int(round(pt)))
         except OSError:
@@ -2616,6 +2812,11 @@ def main():
             for c in range(layout.cols):
                 labeled |= draw_sheet(cv, job, layout, r, c, mural_w, mural_h, chunks, boxes, labels, regions,
                                       palette, style, face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask)
+        _, _, guide_ids = collect_placed_numbers(
+            labels, regions, layout, job, style, f_mask, e_mask, m_mask,
+        )
+    else:
+        guide_ids = set()
     cv.save()
 
     preview_samples = []
@@ -2630,7 +2831,13 @@ def main():
                               chunks, boxes, labels, regions, palette, style, preview_samples,
                               face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask)
         outlined = a.out / "preview_outlined.png"
-        draw_preview_outlined(outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style)
+        draw_preview_outlined(
+            outlined, labels, regions, palette, chunks, layout, job, mural_w, mural_h, style,
+            face_mask=f_mask, eye_mask=e_mask, mouth_mask=m_mask,
+        )
+        _, labeled_preview, guide_ids = collect_placed_numbers(
+            labels, regions, layout, job, style, f_mask, e_mask, m_mask,
+        )
         pages_dir = a.out / "preview_pages"
         rasterize_pdf_pages(kit_pdf, pages_dir)
         print(f"preview: {a.out / 'preview.png'}")
@@ -2680,8 +2887,15 @@ def main():
             "background_colors_reserved": face.get("background_colors_reserved", 0),
         },
     }
+    total_regions = int(regions.max())
+    if a.preview_only:
+        summary["numbered_regions"] = len(labeled_preview)
+        summary["guide_regions"] = len(guide_ids)
+    else:
+        summary["numbered_regions"] = len(labeled)
+        summary["guide_regions"] = len(guide_ids)
+    summary["unlabeled_regions"] = summary["guide_regions"]
     if not a.preview_only:
-        summary["unlabeled_regions"] = int(regions.max()) - len(labeled)
         if getattr(a, "_from_preview_dir", None):
             saved_lm = json.loads((a._from_preview_dir / PREVIEW_JOB_NAME).read_text()).get("label_metrics", {})
             live = summary["label_metrics"]
@@ -2695,8 +2909,8 @@ def main():
     print(f"{n} colors ({a.colors} requested), {summary['regions']} regions, "
           f"{sheet_note} {layout.cols}x{layout.rows} {summary['sheets']['orientation']}, "
           f"{pdf_mb:.1f} MB -> {a.out / 'mural.pdf'}")
-    if summary.get("unlabeled_regions"):
-        print(f"warning: {summary['unlabeled_regions']} regions got no number on any sheet")
+    if summary.get("guide_regions"):
+        print(f"guide shapes (no number): {summary['guide_regions']} of {total_regions} regions")
 
 
 if __name__ == "__main__":
