@@ -10,14 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mural_tiler import DETAIL_LEVELS, PREVIEW_JOB_NAME  # noqa: E402
-from scripts.rembrandt_focal_verify import (  # noqa: E402
-    SIZES,
-    analyze_dir,
-    build_grid,
-    crop_box,
-    load_sheet_page_crop,
-    print_row,
-)
+from scripts.rembrandt_focal_verify import SIZES, analyze_dir, build_grid, crop_box, print_row, save_under_mb  # noqa: E402
+from scripts.focal_quality import audit_job  # noqa: E402
 
 ANIMALS = [
     ("cat", ROOT / "test_assets" / "cat_pexels.jpg", "cat_pexels"),
@@ -87,7 +81,11 @@ def main():
                         "animal": kind,
                         "detail": level,
                         "size": name,
-                        **{k: aft[k] for k in aft if k not in ("face", "labels", "palette", "prev_rgb", "orig_rgb")},
+                        **{
+                            k: aft[k]
+                            for k in aft
+                            if k not in ("face", "labels", "palette", "prev_rgb", "orig_rgb", "sheet_crop")
+                        },
                     })
 
         base_dir = baseline_root / f"{slug}_medium_wall"
@@ -107,13 +105,24 @@ def main():
             orig_c = crop_box(aft["orig_rgb"], box)
             bef_c = crop_box(bef["prev_rgb"], box) if bef else None
             aft_c = crop_box(aft["prev_rgb"], box)
-            sheet_c = load_sheet_page_crop(wall, box)
+            sheet_c = aft["sheet_crop"] if aft.get("sheet_crop") is not None else aft_c
             grid_rows.append((orig_c, bef_c if bef_c is not None else aft_c, aft_c, sheet_c))
-        build_grid(grid_rows, artifact / f"{slug}_focal_grid.png")
-        print(f"wrote {artifact / f'{slug}_focal_grid.png'}")
+        out_img = artifact / f"{slug}_focal_grid.jpg"
+        build_grid(grid_rows, out_img)
+        for level in DETAIL_LEVELS:
+            fails = audit_job(after_root / f"{slug}_{level}_wall")
+            if fails:
+                print(f"QUALITY FAIL {slug}_{level}_wall: {fails}")
+        print(f"wrote {out_img}")
 
     (artifact / "animal_focal_metrics.json").write_text(json.dumps(summary_all, indent=2) + "\n")
-    return 0
+    quality_failed = False
+    for kind, img_path, slug in ANIMALS:
+        for level in DETAIL_LEVELS:
+            fails = audit_job(after_root / f"{slug}_{level}_wall")
+            if fails:
+                quality_failed = True
+    return 1 if quality_failed else 0
 
 
 if __name__ == "__main__":

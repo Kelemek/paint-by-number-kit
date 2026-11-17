@@ -82,6 +82,13 @@ def main():
             ])
             bad = json.loads((mismatch / "paint_areas.json").read_text())["regions"]
             print(f"  mismatch_rerun_regions={bad} (preview had {prev['regions']})")
+            if FACE and name == "wall":
+                from scripts.focal_quality import audit_job
+
+                fq = audit_job(base)
+                if fq:
+                    failed_mono = True
+                    print(f"  FOCAL_QUALITY FAIL: {fq}")
     return 1 if failed_mono else 0
 
 

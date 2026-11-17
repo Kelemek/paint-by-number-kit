@@ -413,7 +413,7 @@ EYE_REGION_FLOOR_IN = 0.06     # still label-able with a small number on a canva
 MOUTH_COLORS = 2               # floor for lip shadow / mouth opening tones
 MOUTH_REGION_FRAC = 0.25
 MOUTH_REGION_FLOOR_IN = 0.06
-MOUTH_FEATHER = 0.24
+MOUTH_FEATHER = 0.14
 
 
 def parse_face_box(text):
@@ -694,8 +694,8 @@ def _eye_disks_from_contrast(rgb_img, head_box, img_w, img_h):
 def _muzzle_ellipse_animal(head_box):
     x0, y0, x1, y1 = head_box
     bw, bh = x1 - x0, y1 - y0
-    cx, cy = (x0 + x1) / 2, y0 + 0.76 * bh
-    return (cx, cy, 0.24 * bw, 0.15 * bh)
+    cx, cy = (x0 + x1) / 2, y0 + 0.55 * bh
+    return (cx, cy, 0.10 * bw, 0.06 * bh)
 
 
 def _empty_subject_info(args):
@@ -1098,29 +1098,14 @@ def _assign_nearest_lab(rgb, centers_lab):
 
 
 def _median_composite(img, face_mask, ppi, eye_mask=None, mouth_mask=None, colors=8):
-    """Stronger smoothing in the background; face moderate; eyes/mouth keep original pixels."""
+    """Heavy smoothing in the background only; subject skin stays on original pixels."""
     bg_k = 2 * int(0.12 * ppi) + 1
     if colors >= 20:
         bg_k = min(bg_k + 2, 2 * int(0.16 * ppi) + 1)
-    face_k = 2 * int(0.035 * ppi) + 1
     orig = np.asarray(img)
     bg = np.asarray(img.filter(ImageFilter.MedianFilter(bg_k)))
-    face = orig if face_k < 3 else np.asarray(img.filter(ImageFilter.MedianFilter(max(3, face_k))))
-    m_face = face_mask[..., None]
-    mixed = face * m_face + bg * (1 - m_face)
-    focal = orig.copy()
-    if eye_mask is not None:
-        m_eye = (eye_mask >= 0.35)[..., None]
-        focal = np.where(m_eye, orig, focal)
-    if mouth_mask is not None:
-        m_mouth = (mouth_mask >= 0.35)[..., None]
-        focal = np.where(m_mouth, orig, focal)
-    mask_focal = np.zeros(face_mask.shape, dtype=bool)
-    if eye_mask is not None:
-        mask_focal |= eye_mask >= 0.35
-    if mouth_mask is not None:
-        mask_focal |= mouth_mask >= 0.35
-    mixed = np.where(mask_focal[..., None], focal, mixed)
+    in_face = face_mask >= 0.35
+    mixed = np.where(in_face[..., None], orig, bg)
     return np.rint(mixed).astype(np.uint8)
 
 
@@ -1142,86 +1127,61 @@ def _clahe_eyes(rgb, eye_mask, clip=2.0, tile=4):
     return np.rint(enhanced * m + rgb * (1 - m)).astype(np.uint8)
 
 
+def _kmeans_centers_with_dark_seed(pixels, n, seed, percentile=15, merge_focal=2.0):
+    """Cluster subject pixels; at most one darkest-percentile seed joins the palette candidates."""
+    if n <= 0 or len(pixels) == 0:
+        return np.zeros((0, 3))
+    slots = []
+    if n >= 2:
+        dark = _dark_lab_slots(pixels, 1, percentile=percentile)
+        if len(dark):
+            slots.append(dark)
+    rest = max(1, n - len(slots))
+    slots.append(_kmeans_lab(pixels, rest, seed, weight_exp=0.4))
+    stacked = np.vstack(slots)
+    return _merge_close_lab(stacked, min_dist=merge_focal, target_count=n)
+
+
 def quantize_face_priority(img, n, ppi, face_mask, eye_mask=None, mouth_mask=None,
                            n_skin=0, n_eye=0, n_mouth=0, n_bg=0, merge_min_dist=3.5, detail=None):
-    """Reserve palette slots for eyes, mouth, face skin, and a small bg set; total stays at N."""
+    """Reserve palette slots for eyes, mouth, face skin, and bg; assign every pixel via nearest Lab to original."""
     if not n_skin:
         n_skin, n_eye, n_mouth, n_bg = feature_color_budget(n, detail)
     mixed = _median_composite(img, face_mask, ppi, eye_mask, mouth_mask, colors=n)
     orig = np.asarray(img)
     n_eye = n_eye if eye_mask is not None and n_eye > 0 else 0
     n_mouth = n_mouth if mouth_mask is not None and n_mouth > 0 else 0
-    eye_f = eye_mask >= 0.5 if eye_mask is not None else np.zeros_like(face_mask, dtype=bool)
-    mouth_f = mouth_mask >= 0.5 if mouth_mask is not None else np.zeros_like(face_mask, dtype=bool)
+    eye_f = eye_mask >= 0.55 if eye_mask is not None else np.zeros_like(face_mask, dtype=bool)
+    mouth_f = mouth_mask >= 0.55 if mouth_mask is not None else np.zeros_like(face_mask, dtype=bool)
     eye_pix = orig[eye_f].reshape(-1, 3) if n_eye else np.zeros((0, 3), np.uint8)
     mouth_pix = orig[mouth_f].reshape(-1, 3) if n_mouth else np.zeros((0, 3), np.uint8)
-    face_pix = mixed[(face_mask >= 0.5) & ~eye_f & ~mouth_f].reshape(-1, 3)
+    face_pix = orig[(face_mask >= 0.5) & ~eye_f & ~mouth_f].reshape(-1, 3)
     bg_pix = mixed[face_mask < 0.5].reshape(-1, 3)
     parts = []
-    n_eye_kept = n_mouth_kept = 0
     merge = merge_min_dist
-    merge_focal = max(0.8, merge * 0.45)
-    if n_eye and len(eye_pix) >= max(2, n_eye // 2):
-        dark_n = max(1, n_eye // 2)
-        dark = _dark_lab_slots(eye_pix, dark_n, percentile=10)
-        rest = max(0, n_eye - len(dark))
-        if rest:
-            km = _kmeans_lab(eye_pix, rest, SEED, weight_exp=0.2)
-            eye_c = np.vstack([dark, km]) if len(dark) else km
-        else:
-            eye_c = dark
-        eye_c = _merge_close_lab(eye_c, min_dist=merge_focal, target_count=n_eye)
-        parts.append(eye_c)
-        n_eye_kept = len(eye_c)
+    merge_focal = max(1.2, merge * 0.55)
+    if n_eye and len(eye_pix) >= 2:
+        parts.append(_kmeans_centers_with_dark_seed(eye_pix, n_eye, SEED, percentile=12, merge_focal=merge_focal))
     if n_mouth and len(mouth_pix) >= 1:
-        dark = _dark_lab_slots(mouth_pix, max(1, n_mouth // 2), percentile=18)
-        rest = max(0, n_mouth - len(dark))
-        if rest:
-            km = _kmeans_lab(mouth_pix, rest, SEED + 1, weight_exp=0.25)
-            mouth_c = np.vstack([dark, km]) if len(dark) else km
-        else:
-            mouth_c = dark
-        mouth_c = _merge_close_lab(mouth_c, min_dist=merge_focal, target_count=n_mouth)
-        parts.append(mouth_c)
-        n_mouth_kept = len(mouth_c)
+        parts.append(_kmeans_centers_with_dark_seed(mouth_pix, n_mouth, SEED + 1, percentile=22, merge_focal=merge_focal))
     if len(face_pix):
-        parts.append(_kmeans_lab(face_pix, n_skin, SEED + 2))
+        parts.append(_kmeans_lab(face_pix, n_skin, SEED + 2, weight_exp=0.45))
     if len(bg_pix):
         parts.append(_kmeans_lab(bg_pix, n_bg, SEED + 3, weight_exp=0.65))
     if not parts:
         return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
     centers = _merge_close_lab(np.vstack(parts), min_dist=merge, target_count=n)
-    # Fill slots freed by merging, preferring leftover eye then face variation.
-    # New unique eye extras stay at the end of the kept list; count them as eye colors.
-    if len(centers) < n and len(eye_pix):
-        before = len(centers)
-        extra = _kmeans_lab(eye_pix, n_eye + (n - len(centers)), SEED + 3, weight_exp=0.25)
-        centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
-        n_eye_kept += max(0, len(centers) - before)
     if len(centers) < n and len(face_pix):
         extra = _kmeans_lab(face_pix, n_skin + (n - len(centers)), SEED + 4)
         centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
     if len(centers) < n:
-        extra = _kmeans_lab(mixed.reshape(-1, 3), n, SEED + 5)
+        extra = _kmeans_lab(orig.reshape(-1, 3), n, SEED + 5)
         centers = _merge_close_lab(np.vstack([centers, extra]), min_dist=merge, target_count=n)
     if len(centers) > n:
         centers = centers[:n]
-        n_eye_kept = min(n_eye_kept, len(centers))
     if len(centers) < 2:
         return quantize(Image.fromarray(mixed), n, ppi, merge_min_dist=merge_min_dist)
-    labels = _assign_nearest_lab(mixed, centers)
-    off = 0
-    if n_eye_kept >= 1:
-        eye_centers = centers[off:off + n_eye_kept]
-        off += n_eye_kept
-        lifted = _clahe_eyes(mixed, eye_mask, clip=1.6, tile=4)
-        labels_eye = _assign_nearest_lab(lifted, eye_centers)
-        labels = np.where(eye_mask >= 0.5, labels_eye, labels)
-    if n_mouth_kept >= 1:
-        mouth_centers = centers[off:off + n_mouth_kept]
-        labels_mouth = _assign_nearest_lab(orig, mouth_centers)
-        labels = np.where(mouth_mask >= 0.5, labels_mouth, labels)
-    return labels
+    return _assign_nearest_lab(orig, centers)
 
 
 def majority_filter_face_aware(labels, n, win_bg, win_face, face_mask, eye_mask=None, mouth_mask=None, preserve_bg=False):
@@ -1284,6 +1244,8 @@ def clean_regions_face_aware(labels, min_area_px, min_thick_px, face_area_px, fa
         slices = ndimage.find_objects(regions)
         changed = False
         for rid in bad[np.argsort(area[bad - 1], kind="stable")]:
+            if eye_frac[rid - 1] > 0.55 or mouth_frac[rid - 1] > 0.55:
+                continue
             sl = tuple(slice(max(s.start - 1, 0), s.stop + 1) for s in slices[rid - 1])
             mask = regions[sl] == rid
             sub = labels[sl]
@@ -1322,6 +1284,67 @@ def rgb_to_lab(rgb):
     xyz /= np.array([0.95047, 1.0, 1.08883])
     f = np.where(xyz > 216 / 24389, np.cbrt(xyz), (24389 / 27 * xyz + 16) / 116)
     return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], axis=-1)
+
+
+def lab_to_rgb(lab):
+    lab = np.asarray(lab, dtype=np.float64)
+    single = lab.ndim == 1
+    if single:
+        lab = lab[None, :]
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    fy = (L + 16) / 116
+    fx = a / 500 + fy
+    fz = fy - b / 200
+    eps = 216 / 24389
+    k = 24389 / 27
+    xr = np.where(fx ** 3 > eps, fx ** 3, (116 * fx - 16) / k)
+    yr = np.where(fy ** 3 > eps, fy ** 3, (116 * fy - 16) / k)
+    zr = np.where(fz ** 3 > eps, fz ** 3, (116 * fz - 16) / k)
+    xyz = np.stack([xr * 0.95047, yr * 1.0, zr * 1.08883], axis=-1)
+    rgb_lin = xyz @ np.array([
+        [3.2406, -1.5372, -0.4986],
+        [-0.9689, 1.8758, 0.0415],
+        [0.0557, -0.2040, 1.0570],
+    ]).T
+    rgb = np.where(rgb_lin > 0.0031308, 1.055 * (rgb_lin ** (1 / 2.4)) - 0.055, 12.92 * rgb_lin)
+    out = np.clip(np.rint(rgb * 255), 0, 255).astype(np.uint8)
+    return out[0] if single else out
+
+
+def _constrain_palette_luminance(labels, rgb, palette, face_mask, eye_mask, mouth_mask, tol=5.0):
+    """Nudge palette swatches so focal zone mean L* stays within tol of the original."""
+    if face_mask is None:
+        return palette
+    pal_lab = rgb_to_lab(palette)
+    orig_lab = rgb_to_lab(rgb)
+    out_lab = pal_lab.copy()
+    eye = eye_mask >= 0.35 if eye_mask is not None else np.zeros(labels.shape, dtype=bool)
+    mouth = mouth_mask >= 0.35 if mouth_mask is not None else np.zeros(labels.shape, dtype=bool)
+    skin = (face_mask >= 0.35) & ~eye & ~mouth
+    zones = (("eye", eye), ("mouth", mouth), ("skin", skin))
+    for _name, mask in zones:
+        if not np.any(mask):
+            continue
+        for k in np.unique(labels[mask]):
+            m = mask & (labels == k)
+            if int(m.sum()) < 8:
+                continue
+            target_l = float(orig_lab[m, 0].mean())
+            cur_l = float(out_lab[k, 0])
+            delta = float(np.clip(target_l - cur_l, -tol, tol))
+            out_lab[k, 0] = cur_l + delta
+    for _name, mask in zones:
+        if not np.any(mask):
+            continue
+        zone_l = float(orig_lab[mask, 0].mean())
+        pix_k = labels[mask]
+        preview_l = float(out_lab[pix_k, 0].mean())
+        zone_delta = float(np.clip(zone_l - preview_l, -tol, tol))
+        if abs(zone_delta) <= 0.25:
+            continue
+        for k in np.unique(pix_k):
+            out_lab[k, 0] = float(np.clip(out_lab[k, 0] + zone_delta, 0, 100))
+    return lab_to_rgb(out_lab)
 
 
 def quantize(img, n, ppi, merge_min_dist=3.5):
@@ -1396,31 +1419,17 @@ def clean_regions(labels, min_area_px, min_thick_px, max_passes=20):
     return labels
 
 
-def _palette_swatch_rgb(labels, rgb, k, eye_mask=None, mouth_mask=None):
-    m = labels == k
-    if not np.any(m):
-        return rgb[m].mean(axis=0)
-    if eye_mask is not None and np.any(m & (eye_mask >= 0.35)):
-        sel = rgb[m & (eye_mask >= 0.35)]
-        l = rgb_to_lab(sel)[:, 0]
-        dark = sel[l <= np.percentile(l, 22)]
-        return dark[np.argmin(rgb_to_lab(dark)[:, 0])] if len(dark) else sel[np.argmin(l)]
-    if mouth_mask is not None and np.any(m & (mouth_mask >= 0.35)):
-        sel = rgb[m & (mouth_mask >= 0.35)]
-        l = rgb_to_lab(sel)[:, 0]
-        dark = sel[l <= np.percentile(l, 25)]
-        return dark[np.argmin(rgb_to_lab(dark)[:, 0])] if len(dark) else sel[l.argmin()]
-    return rgb[m].mean(axis=0)
-
-
-def finalize_palette(labels, rgb, eye_mask=None, mouth_mask=None):
-    """Renumber used colors 0..m-1 from lightest to darkest; eye/mouth swatches use darkest pixels."""
+def finalize_palette(labels, rgb, eye_mask=None, mouth_mask=None, face_mask=None):
+    """Renumber used colors 0..m-1 from lightest to darkest; palette RGB = label means on original."""
     used = np.unique(labels)
-    means = np.array([_palette_swatch_rgb(labels, rgb, k, eye_mask, mouth_mask) for k in used])
+    means = np.array([rgb[labels == k].mean(axis=0) for k in used])
     order = np.argsort(-rgb_to_lab(means)[:, 0], kind="stable")
     remap = np.zeros(labels.max() + 1, dtype=np.int32)
     remap[used[order]] = np.arange(len(used))
-    return remap[labels], np.rint(means[order]).astype(np.uint8)
+    labels = remap[labels]
+    palette = np.rint(means[order]).astype(np.uint8)
+    palette = _constrain_palette_luminance(labels, rgb, palette, face_mask, eye_mask, mouth_mask, tol=5.0)
+    return labels, palette
 
 
 # ---------- boundaries -> smooth vector polylines ----------
@@ -2103,6 +2112,47 @@ def _face_mask_on_sheet(layout, r, c, k, face_mask):
     return float(face_mask[y0:y1, x0:x1].sum())
 
 
+def _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask=None, min_weight=1.0):
+    """Sheet with the most eye + mouth/muzzle mask weight (for verification crops)."""
+    h = w = 0
+    if eye_mask is not None:
+        h, w = eye_mask.shape
+    elif mouth_mask is not None:
+        h, w = mouth_mask.shape
+    elif face_mask is not None:
+        h, w = face_mask.shape
+    else:
+        return None
+    combined = np.zeros((h, w), dtype=np.float32)
+    if eye_mask is not None:
+        combined = np.maximum(combined, eye_mask)
+    if mouth_mask is not None:
+        combined = np.maximum(combined, mouth_mask)
+    return _best_face_sheet(layout, combined, k, min_weight=min_weight)
+
+
+def render_focal_sheet_crop(labels, palette, layout, job, box, eye_mask, mouth_mask, face_mask=None):
+    """Palette view of the mural sheet that best covers the focal region, cropped like previews."""
+    if box is None:
+        return None
+    k = job["scale"] / job["ppi"]
+    pick = _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask)
+    if not pick:
+        return None
+    _r, _c, _area = pick
+    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, _r, _c, k)
+    x0, y0, x1, y1 = (int(v) for v in box)
+    ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
+    ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    tint = float(job.get("sheet_tint", 0))
+    tile = palette[labels[iy0:iy1, ix0:ix1]].astype(np.float64)
+    if tint > 0:
+        tile = np.clip(255.0 * (1 - tint) + tile * tint, 0, 255)
+    return np.rint(tile).astype(np.uint8)
+
+
 def _best_face_sheet(layout, face_mask, k, min_weight=1.0):
     if face_mask is None or float(face_mask.max()) < 0.1:
         return None
@@ -2355,7 +2405,9 @@ def main():
             window = int(round(a.min_region_in / 4 * ppi)) | 1
             labels = majority_filter(labels, a.colors, window)
             labels = clean_regions(labels, (a.min_region_in * ppi) ** 2, a.min_region_in / 2 * ppi)
-        labels, palette = finalize_palette(labels, rgb, face.get("eye_mask"), face.get("mouth_mask"))
+        labels, palette = finalize_palette(
+            labels, rgb, face.get("eye_mask"), face.get("mouth_mask"), face.get("mask"),
+        )
         regions, region_colors = label_regions(labels)
     n = len(palette)
     face_mask = face.get("mask")

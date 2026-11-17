@@ -17,7 +17,9 @@ from mural_tiler import (  # noqa: E402
     PREVIEW_JOB_NAME,
     LABELS_ARCHIVE,
     apply_image_prep,
+    choose_layout,
     fit_to_wall,
+    render_focal_sheet_crop,
     rgb_to_lab,
     resolve_faces,
 )
@@ -82,6 +84,14 @@ def mask_stats(rgb_u8, mask, thresh=0.35):
     }
 
 
+def skin_mask(face_mask, eye_mask, mouth_mask, shape):
+    if face_mask is None:
+        return None
+    eye = eye_mask >= 0.35 if eye_mask is not None else np.zeros(shape, dtype=bool)
+    mouth = mouth_mask >= 0.35 if mouth_mask is not None else np.zeros(shape, dtype=bool)
+    return ((face_mask >= 0.35) & ~eye & ~mouth).astype(np.float32)
+
+
 def preview_stats(preview_rgb, labels, palette, mask, thresh=0.35):
     m = mask >= thresh if mask is not None else np.zeros(labels.shape, dtype=bool)
     if not np.any(m):
@@ -128,6 +138,11 @@ def analyze_dir(job_dir: Path, tag: str):
     prep = meta.get("prep") or "auto"
     img_path = Path(meta.get("argv", {}).get("image") or IMG)
     rgb, face = work_rgb_and_masks(meta, prep, img_path)
+    scale = float(meta.get("argv", {}).get("scale") or 1.0)
+    overlap = float(meta.get("argv", {}).get("overlap_in") or 0.5)
+    wall_w_in, wall_h_in = meta["wall_width_ft"] * 12, meta["wall_height_ft"] * 12
+    layout = choose_layout(wall_w_in * scale, wall_h_in * scale, overlap)
+    job = {"scale": scale, "ppi": meta["ppi"], "sheet_tint": meta.get("argv", {}).get("sheet_tint", 0)}
     data = np.load(job_dir / LABELS_ARCHIVE)
     labels = data["labels"]
     palette = data["palette"]
@@ -136,7 +151,10 @@ def analyze_dir(job_dir: Path, tag: str):
     eye_mask = data.get("eye_mask")
     mouth_mask = data.get("mouth_mask")
     prev = np.asarray(Image.open(job_dir / "preview.png"))
+    sk = skin_mask(face_mask, eye_mask, mouth_mask, labels.shape)
     lm = meta["label_metrics"]
+    box = focal_bbox(face)
+    sheet = render_focal_sheet_crop(labels, palette, layout, job, box, eye_mask, mouth_mask, face_mask)
     row = {
         "tag": tag,
         "detail": meta["detail"],
@@ -150,7 +168,10 @@ def analyze_dir(job_dir: Path, tag: str):
         "original_mouth": mask_stats(rgb, mouth_mask),
         "preview_eye": preview_stats(prev, labels, palette, eye_mask),
         "preview_mouth": preview_stats(prev, labels, palette, mouth_mask),
-        "focal_bbox": focal_bbox(face),
+        "original_skin": mask_stats(rgb, sk),
+        "preview_skin": preview_stats(prev, labels, palette, sk),
+        "focal_bbox": box,
+        "sheet_crop": sheet,
         "face": face,
         "labels": labels,
         "palette": palette,
@@ -158,26 +179,6 @@ def analyze_dir(job_dir: Path, tag: str):
         "orig_rgb": rgb,
     }
     return row
-
-
-def load_sheet_page_crop(job_dir: Path, box):
-    pages = sorted((job_dir / "preview_pages").glob("page-*.png"))
-    if not pages or box is None:
-        return None
-    # Sample sheet is usually last pages; pick largest crop overlap with focal box via heuristics: page 4+ often sheets
-    for p in reversed(pages):
-        im = np.asarray(Image.open(p).convert("RGB"))
-        # Sheet pages are landscape letter; use center band as rough mural tile for wall jobs
-        h, w = im.shape[:2]
-        tile = im[int(h * 0.12) : int(h * 0.88), int(w * 0.08) : int(w * 0.92)]
-        x0, y0, x1, y1 = box
-        fw, fh = x1 - x0, y1 - y0
-        crop = np.asarray(
-            Image.fromarray(tile).resize((fw, fh), Image.LANCZOS)
-        )
-        if crop.size:
-            return crop
-    return None
 
 
 def build_grid(rows_by_level, out_path: Path):
@@ -201,19 +202,28 @@ def build_grid(rows_by_level, out_path: Path):
                 continue
             im = Image.fromarray(tile).resize((cell_w, cell_h), Image.LANCZOS)
             grid[y0 : y0 + cell_h, ci * cell_w : (ci + 1) * cell_w] = np.asarray(im)
-    Image.fromarray(grid).save(out_path, optimize=True)
+    save_under_mb(grid, out_path)
+
+
+def save_under_mb(rgb, path: Path, max_bytes=2_900_000):
+    im = Image.fromarray(rgb)
+    for q in range(92, 40, -8):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        im.save(path, format="JPEG", quality=q, optimize=True)
+        if path.stat().st_size <= max_bytes:
+            return
+    im = im.resize((im.width * 3 // 4, im.height * 3 // 4), Image.LANCZOS)
+    im.save(path, format="JPEG", quality=85, optimize=True)
 
 
 def print_row(r):
     def fmt(name, orig, prev):
         if not orig or not prev:
             return f"{name}: n/a"
-        d_mean = orig["mean_L"] - prev["mean_L"]
-        d_min = orig["min_L"] - prev["min_L"]
-        extra = f", darkest_share={prev.get('darkest_palette_share')}" if "darkest_palette_share" in prev else ""
+        err = prev["mean_L"] - orig["mean_L"]
         return (
-            f"{name}: orig L* mean/min={orig['mean_L']}/{orig['min_L']} "
-            f"preview {prev['mean_L']}/{prev['min_L']} (Δmean={d_mean:+.1f}, Δmin={d_min:+.1f}{extra})"
+            f"{name}: orig={orig['mean_L']:.1f} preview={prev['mean_L']:.1f} "
+            f"error={err:+.1f} (|error|={abs(err):.1f}, tol 5)"
         )
 
     print(
@@ -223,6 +233,7 @@ def print_row(r):
     )
     print("  " + fmt("eye", r["original_eye"], r["preview_eye"]))
     print("  " + fmt("mouth", r["original_mouth"], r["preview_mouth"]))
+    print("  " + fmt("skin", r.get("original_skin"), r.get("preview_skin")))
 
 
 def main():
@@ -250,13 +261,13 @@ def main():
         orig_c = crop_box(aft["orig_rgb"], box)
         bef_c = crop_box(bef["prev_rgb"], box) if bef else None
         aft_c = crop_box(aft["prev_rgb"], box)
-        sheet_c = load_sheet_page_crop(after_root / tag, box)
+        sheet_c = aft["sheet_crop"] if aft.get("sheet_crop") is not None else aft_c
         grid_rows.append((orig_c, bef_c if bef_c is not None else aft_c, aft_c, sheet_c))
 
-    build_grid(grid_rows, artifact / "rembrandt_focal_grid.png")
+    build_grid(grid_rows, artifact / "rembrandt_focal_grid.jpg")
     med = after_root / "medium_wall" / "preview.png"
     if med.is_file():
-        Image.open(med).save(artifact / "rembrandt_after_preview_medium.png", optimize=True)
+        save_under_mb(np.asarray(Image.open(med)), artifact / "rembrandt_after_preview_medium.jpg")
 
     report = artifact / "rembrandt_focal_metrics.json"
     summary = []
@@ -266,11 +277,24 @@ def main():
             p = after_root / tag
             if (p / PREVIEW_JOB_NAME).is_file():
                 r = analyze_dir(p, "after")
-                summary.append({k: r[k] for k in r if k not in ("face", "labels", "palette", "prev_rgb", "orig_rgb")})
+                summary.append({
+                    k: r[k]
+                    for k in r
+                    if k not in ("face", "labels", "palette", "prev_rgb", "orig_rgb", "sheet_crop")
+                })
     report.write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"wrote {artifact / 'rembrandt_focal_grid.png'}")
+    from scripts.focal_quality import audit_job
+
+    quality_failed = False
+    for level in LEVELS:
+        tag = f"{level}_wall"
+        fails = audit_job(after_root / tag)
+        if fails:
+            quality_failed = True
+            print(f"QUALITY FAIL {tag}: {fails}")
+    print(f"wrote {artifact / 'rembrandt_focal_grid.jpg'}")
     print(f"wrote {report}")
-    return 0
+    return 1 if quality_failed else 0
 
 
 if __name__ == "__main__":
