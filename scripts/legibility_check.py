@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Fail when mural sheets place numbers under 6 pt or with overlapping boxes."""
+"""Fail when mural sheets place numbers under 6 pt, leaders over 12 mm, or overlapping boxes."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -15,7 +16,9 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from legibility_layout import (  # noqa: E402
+    MAX_LEADER_MM,
     MIN_LEGIBLE_PT,
+    analyze_placement_layout,
     _aabb_overlap,
     _number_aabb_work,
     _segment_intersects_aabb,
@@ -28,11 +31,10 @@ from mural_tiler import (  # noqa: E402
     collect_placed_numbers,
     load_saved_labels,
     merge_crowded_regions,
-    label_regions,
 )
 
 
-def check_placement(job_dir: Path) -> list[str]:
+def evaluate_job(job_dir: Path) -> tuple[list[str], dict]:
     meta = json.loads((job_dir / PREVIEW_JOB_NAME).read_text())
     labels, palette, _r0, face_mask, eye_mask, mouth_mask = load_saved_labels(job_dir)
     face = meta.get("subject_priority") or meta.get("face_priority") or {}
@@ -59,8 +61,15 @@ def check_placement(job_dir: Path) -> list[str]:
         labels, regions, layout, job, style, face_mask, eye_mask, mouth_mask,
     )
     px_to_pt = (job["scale"] / job["ppi"]) * 72.0
+    stats = analyze_placement_layout(placements, px_to_pt, style, job["ppi"], job["scale"])
+    stats["numbered_inside"] = len(inside_all)
+    stats["callout_regions"] = len(callout_all)
+    stats["guide_regions"] = len(guide_all)
+    stats["regions_after_merge"] = int(regions.max())
+
     errs = []
     boxes = []
+    mm_per_px = 25.4 / (job["ppi"] * job["scale"])
     for p in placements:
         if p.size < MIN_LEGIBLE_PT - 1e-6:
             errs.append(
@@ -72,47 +81,58 @@ def check_placement(job_dir: Path) -> list[str]:
                 errs.append(f"number {p.text} overlaps another label")
                 break
         if p.is_callout:
+            length_mm = math.hypot(p.num_x - p.dot_x, p.num_y - p.dot_y) * mm_per_px
+            if length_mm > MAX_LEADER_MM + 1e-6:
+                errs.append(f"leader for {p.text} is {length_mm:.2f} mm (> {MAX_LEADER_MM} mm)")
             for other in boxes:
                 if _segment_intersects_aabb(p.dot_x, p.dot_y, p.num_x, p.num_y, other):
                     errs.append(f"leader for {p.text} crosses another number box")
                     break
-            if p.region_id not in labeled_all:
-                errs.append(f"callout region {p.region_id} not counted as labeled")
         boxes.append(box)
     for rid in callout_all | inside_all:
         if rid not in labeled_all:
             errs.append(f"region {rid} marked placed but missing from labeled set")
-    return errs
+    return errs, stats
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("job_dir", type=Path, help="preview job directory (preview_job.json + labels.npz)")
-    ap.add_argument("--dpi", type=int, default=300, help="raster DPI for optional PDF sanity check")
+    ap.add_argument("--stats-json", type=Path, help="write layout statistics JSON")
+    ap.add_argument("--compare-json", type=Path, help="optional prior stats JSON for before/after")
     args = ap.parse_args()
     job_dir = args.job_dir.resolve()
-    errs = check_placement(job_dir)
+    errs, stats = evaluate_job(job_dir)
+    if args.compare_json and args.compare_json.is_file():
+        prior = json.loads(args.compare_json.read_text())
+        stats["step2_reference"] = prior
+        stats["vs_step2"] = {
+            "leader_max_mm_delta": round(stats["leader_max_mm"] - prior.get("leader_max_mm", 0), 3),
+            "leader_median_mm_delta": round(
+                stats["leader_median_mm"] - prior.get("leader_median_mm", 0), 3
+            ),
+            "crossings_delta": stats["leader_line_crossings"] - prior.get("leader_line_crossings", 0),
+            "min_number_gap_mm_delta": round(
+                stats["min_number_gap_mm"] - prior.get("min_number_gap_mm", 0), 3
+            ),
+        }
+    if args.stats_json:
+        args.stats_json.write_text(json.dumps(stats, indent=2) + "\n")
     mural = job_dir / "mural.pdf"
-    if not mural.is_file():
-        full = job_dir / "full" / "mural.pdf"
-        if full.is_file():
-            mural = full
     if mural.is_file():
         try:
-            n_pages = len(PdfReader(str(mural)).pages)
-            if n_pages > 0:
-                pass
+            PdfReader(str(mural))
         except Exception as exc:
             errs.append(f"pdf read skipped: {exc}")
     if errs:
         print("\n".join(errs), file=sys.stderr)
+        print(json.dumps(stats, indent=2))
         raise SystemExit(1)
-    meta = json.loads((job_dir / PREVIEW_JOB_NAME).read_text())
-    data = np.load(job_dir / LABELS_ARCHIVE)
     print(
-        f"ok: {job_dir.name} regions={int(data['regions'].max())} "
-        f"wall={meta['wall_width_ft']}x{meta['wall_height_ft']} ft detail={meta.get('detail')}"
+        f"ok: leaders max={stats['leader_max_mm']} mm median={stats['leader_median_mm']} mm "
+        f"crossings={stats['leader_line_crossings']} min_gap={stats['min_number_gap_mm']} mm"
     )
+    print(json.dumps(stats, indent=2))
 
 
 if __name__ == "__main__":

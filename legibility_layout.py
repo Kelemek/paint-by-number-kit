@@ -10,8 +10,11 @@ from scipy import ndimage
 PT = 72.0
 MIN_LEGIBLE_PT = 6.0
 PAINTABLE_DIAM_MM = 2.5
-MAX_LEADER_MM = 15.0
+PREFERRED_LEADER_MM = 8.0
+MAX_LEADER_MM = 12.0
+MIN_NUMBER_GAP_MM = 1.5
 LEADER_LINE_PT = 0.3
+LEADER_DOT_PAD_PT = 0.8
 LEADER_GRAY = 0.35
 EYE_SPOTS_PER_DISK = 8
 MOUTH_PROTECTED_SPOTS = 4
@@ -56,8 +59,12 @@ def paintable_radius_work_px(ppi, scale=1.0):
     return diam_in * ppi / 2.0
 
 
+def mm_to_work_px(mm, ppi, scale=1.0):
+    return (mm / 25.4) * scale * ppi
+
+
 def max_leader_work_px(ppi, scale=1.0):
-    return (MAX_LEADER_MM / 25.4) * scale * ppi
+    return mm_to_work_px(MAX_LEADER_MM, ppi, scale)
 
 
 def region_inscribed_radii(labels, regions):
@@ -108,6 +115,72 @@ def _number_aabb_work(x, y, text, size, font, px_to_pt):
 
 def _aabb_overlap(a, b, pad=0.35):
     return not (a[2] + pad < b[0] or b[2] + pad < a[0] or a[3] + pad < b[1] or b[3] + pad < a[1])
+
+
+def _box_gap(a, b):
+    dx = max(0.0, max(a[0] - b[2], b[0] - a[2]))
+    dy = max(0.0, max(a[1] - b[3], b[1] - a[3]))
+    return math.hypot(dx, dy)
+
+
+def _boxes_clear(box, others, min_gap):
+    for other in others:
+        if _box_gap(box, other) < min_gap:
+            return False
+    return True
+
+
+def _orient(ax, ay, bx, by, cx, cy):
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+
+def _on_segment(ax, ay, bx, by, cx, cy, eps=0.35):
+    return (
+        min(ax, bx) - eps <= cx <= max(ax, bx) + eps
+        and min(ay, by) - eps <= cy <= max(ay, by) + eps
+    )
+
+
+def _segments_intersect(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1, eps=0.35):
+    o1 = _orient(ax0, ay0, ax1, ay1, bx0, by0)
+    o2 = _orient(ax0, ay0, ax1, ay1, bx1, by1)
+    o3 = _orient(bx0, by0, bx1, by1, ax0, ay0)
+    o4 = _orient(bx0, by0, bx1, by1, ax1, ay1)
+    if o1 * o2 < -eps and o3 * o4 < -eps:
+        return True
+    if abs(o1) <= eps and _on_segment(ax0, ay0, ax1, ay1, bx0, by0):
+        return True
+    if abs(o2) <= eps and _on_segment(ax0, ay0, ax1, ay1, bx1, by1):
+        return True
+    if abs(o3) <= eps and _on_segment(bx0, by0, bx1, by1, ax0, ay0):
+        return True
+    if abs(o4) <= eps and _on_segment(bx0, by0, bx1, by1, ax1, ay1):
+        return True
+    return False
+
+
+def _point_seg_distance(px, py, x0, y0, x1, y1):
+    dx, dy = x1 - x0, y1 - y0
+    den = dx * dx + dy * dy
+    if den < 1e-9:
+        return math.hypot(px - x0, py - y0)
+    t = max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / den))
+    qx, qy = x0 + t * dx, y0 + t * dy
+    return math.hypot(px - qx, py - qy)
+
+
+def _leader_blocked(dot_x, dot_y, num_x, num_y, placed_boxes, leader_segs, leader_dots, own_dot, dot_pad):
+    if any(_segment_intersects_aabb(dot_x, dot_y, num_x, num_y, box) for box in placed_boxes):
+        return True
+    for d0x, d0y, n0x, n0y in leader_segs:
+        if _segments_intersect(dot_x, dot_y, num_x, num_y, d0x, d0y, n0x, n0y):
+            return True
+    for dx, dy in leader_dots:
+        if abs(dx - own_dot[0]) < 0.01 and abs(dy - own_dot[1]) < 0.01:
+            continue
+        if _point_seg_distance(dx, dy, dot_x, dot_y, num_x, num_y) < dot_pad:
+            return True
+    return False
 
 
 def _segment_intersects_aabb(x0, y0, x1, y1, box, pad=0.2):
@@ -283,35 +356,108 @@ def _search_callout(
     style,
     px_to_pt,
     placed_boxes,
+    leader_segs,
+    leader_dots,
     cell_labels,
     cell_w,
     cell_h,
     max_leader,
-    region_areas,
+    color_area,
+    min_gap,
+    dot_pad,
+    ppi,
+    scale,
 ):
-    best = None
-    best_score = 1e18
     size_use = max(MIN_LEGIBLE_PT, min(size, style.max_pt))
-    for ang in range(0, 360, 12):
-        rad = math.radians(ang)
-        ux, uy = math.cos(rad), math.sin(rad)
-        for step in np.linspace(4.0, max_leader, num=18):
-            nx = dot_x + ux * step
-            ny = dot_y + uy * step
-            if nx < 1 or ny < 1 or nx >= cell_w - 1 or ny >= cell_h - 1:
-                continue
-            box = _number_aabb_work(nx, ny, text, size_use, style.font, px_to_pt)
-            if any(_aabb_overlap(box, other) for other in placed_boxes):
-                continue
-            if any(_segment_intersects_aabb(dot_x, dot_y, nx, ny, other) for other in placed_boxes):
-                continue
-            ci = int(cell_labels[int(ny), int(nx)])
-            host = region_areas.get(ci, 0)
-            score = step - 0.002 * host + 0.5 * abs(ang % 90 - 45)
-            if score < best_score:
-                best_score = score
+    return _search_callout_inner(
+        dot_x, dot_y, text, size_use, style, px_to_pt, placed_boxes,
+        leader_segs, leader_dots, cell_labels, cell_w, cell_h,
+        max_leader, color_area, min_gap, dot_pad, ppi, scale,
+    )
+
+
+def _search_callout_inner(
+    dot_x,
+    dot_y,
+    text,
+    size_use,
+    style,
+    px_to_pt,
+    placed_boxes,
+    leader_segs,
+    leader_dots,
+    cell_labels,
+    cell_w,
+    cell_h,
+    max_leader,
+    color_area,
+    min_gap,
+    dot_pad,
+    ppi,
+    scale,
+):
+    mm_per_px = 25.4 / (ppi * scale)
+
+    def score_candidate(nx, ny, step, host, crossings):
+        length_mm = step * mm_per_px
+        if length_mm > MAX_LEADER_MM:
+            return None
+        if crossings > 0:
+            return 1e6 + crossings * 500.0 + length_mm
+        cost = length_mm
+        if length_mm > PREFERRED_LEADER_MM:
+            cost += 2.5 * (length_mm - PREFERRED_LEADER_MM)
+        crowd = 0.0
+        box = _number_aabb_work(nx, ny, text, size_use, style.font, px_to_pt)
+        for other in placed_boxes:
+            gap = _box_gap(box, other)
+            crowd += 8.0 / max(gap, min_gap * 0.35)
+        cost += crowd
+        cost -= 0.003 * host
+        return cost
+
+    def consider(gap_req, crossings_allowed):
+        best = None
+        best_score = 1e18
+        for ang in np.arange(0.0, 360.0, 10.0):
+            rad = math.radians(ang)
+            ux, uy = math.cos(rad), math.sin(rad)
+            for step in np.linspace(3.0, max_leader, num=22):
+                nx = dot_x + ux * step
+                ny = dot_y + uy * step
+                if nx < 1 or ny < 1 or nx >= cell_w - 1 or ny >= cell_h - 1:
+                    continue
+                box = _number_aabb_work(nx, ny, text, size_use, style.font, px_to_pt)
+                if not _boxes_clear(box, placed_boxes, gap_req):
+                    continue
+                crossings = 0
+                for d0x, d0y, n0x, n0y in leader_segs:
+                    if _segments_intersect(dot_x, dot_y, nx, ny, d0x, d0y, n0x, n0y):
+                        crossings += 1
+                if crossings > 0 and not crossings_allowed:
+                    continue
+                if _leader_blocked(dot_x, dot_y, nx, ny, placed_boxes, leader_segs, leader_dots,
+                                   (dot_x, dot_y), dot_pad):
+                    continue
+                ci = int(cell_labels[int(ny), int(nx)])
+                host = color_area.get(ci, 0)
+                sc = score_candidate(nx, ny, step, host, crossings)
+                if sc is None or sc >= best_score:
+                    continue
+                best_score = sc
                 best = (nx, ny, size_use)
-    return best
+        return best
+
+    for gap_req, allow_cross in (
+        (min_gap, False),
+        (min_gap, True),
+        (min_gap * 0.55, True),
+        (min_gap * 0.35, True),
+    ):
+        hit = consider(gap_req, allow_cross)
+        if hit is not None:
+            return hit
+    return None
 
 
 def place_cell_labels(
@@ -327,6 +473,8 @@ def place_cell_labels(
     dist = interior_distance(cell_labels)
     paintable_r = paintable_radius_work_px(ppi, scale)
     max_leader = max_leader_work_px(ppi, scale)
+    min_gap = mm_to_work_px(MIN_NUMBER_GAP_MM, ppi, scale)
+    dot_pad = mm_to_work_px(0.45, ppi, scale)
     h, w = cell_labels.shape
     region_areas = {}
     for rid in np.unique(cell_regions):
@@ -382,18 +530,31 @@ def place_cell_labels(
         dot_x, dot_y = _region_anchor(cell_labels, cell_regions, rid)
         pending.append((rid, text, dot_x, dot_y, radius))
 
-    pending.sort(key=lambda t: t[4])
+    leader_segs = []
+    leader_dots = []
+
+    def neighbor_density(ix, iy):
+        cnt = 0
+        for _, _, ox, oy, _ in pending:
+            if math.hypot(ox - ix, oy - iy) < max_leader * 0.35:
+                cnt += 1
+        return cnt
+
+    pending.sort(key=lambda t: (neighbor_density(t[2], t[3]), t[4]))
     for rid, text, dot_x, dot_y, radius in pending:
         size = legible_number_pt(radius, text, px_to_pt, style) or MIN_LEGIBLE_PT
         hit = _search_callout(
             dot_x, dot_y, text, size, style, px_to_pt, placed_boxes,
-            cell_labels, w, h, max_leader, color_area,
+            leader_segs, leader_dots, cell_labels, w, h, max_leader, color_area,
+            min_gap, dot_pad, ppi, scale,
         )
         if hit is None:
             continue
         nx, ny, size_use = hit
         placements.append(NumberPlacement(rid, text, size_use, nx, ny, dot_x, dot_y))
         placed_boxes.append(_number_aabb_work(nx, ny, text, size_use, style.font, px_to_pt))
+        leader_segs.append((dot_x, dot_y, nx, ny))
+        leader_dots.append((dot_x, dot_y))
         labeled.add(rid)
 
     guide = {int(r) for r in np.unique(cell_regions) if r > 0} - labeled
@@ -451,3 +612,61 @@ def collect_all_placements(labels, regions, layout, job, style, face_mask=None, 
             guide_all |= guide
     inside = {p.region_id for p in all_place if not p.is_callout}
     return all_place, labeled_all, guide_all, inside, callout_all
+
+
+def analyze_placement_layout(placements, px_to_pt, style, ppi, scale):
+    """Leader lengths, crossings, and minimum gap between number boxes (work/mural px)."""
+    boxes = [
+        _number_aabb_work(p.num_x, p.num_y, p.text, p.size, style.font, px_to_pt) for p in placements
+    ]
+    mm_per_px = 25.4 / (ppi * scale)
+    min_gap_px = float("inf")
+    for i, a in enumerate(boxes):
+        for j in range(i + 1, len(boxes)):
+            min_gap_px = min(min_gap_px, _box_gap(a, boxes[j]))
+    if not boxes:
+        min_gap_px = 0.0
+
+    leader_mm = []
+    segs = []
+    dots = []
+    dot_pad = mm_to_work_px(0.45, ppi, scale)
+    for p in placements:
+        if not p.is_callout:
+            continue
+        step = math.hypot(p.num_x - p.dot_x, p.num_y - p.dot_y)
+        leader_mm.append(step * mm_per_px)
+        segs.append((p.dot_x, p.dot_y, p.num_x, p.num_y))
+        dots.append((p.dot_x, p.dot_y))
+
+    crossings = 0
+    for i in range(len(segs)):
+        for j in range(i + 1, len(segs)):
+            a = segs[i]
+            b = segs[j]
+            if _segments_intersect(*a, *b):
+                crossings += 1
+
+    leader_through_dot = 0
+    for idx, (d0x, d0y, n0x, n0y) in enumerate(segs):
+        for j, (dx, dy) in enumerate(dots):
+            if j == idx:
+                continue
+            if _point_seg_distance(dx, dy, d0x, d0y, n0x, n0y) < dot_pad:
+                leader_through_dot += 1
+
+    if leader_mm:
+        arr = np.asarray(leader_mm)
+        med = float(np.median(arr))
+        mx = float(np.max(arr))
+    else:
+        med = mx = 0.0
+
+    return {
+        "leader_count": len(leader_mm),
+        "leader_max_mm": round(mx, 3),
+        "leader_median_mm": round(med, 3),
+        "leader_line_crossings": crossings,
+        "leaders_through_foreign_dots": leader_through_dot,
+        "min_number_gap_mm": round(min_gap_px * mm_per_px, 3),
+    }
