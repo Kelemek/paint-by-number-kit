@@ -398,6 +398,11 @@ FACE_MIN_COLORS = 4            # at least this many reserved tones (Low needs 4)
 FACE_REGION_FRAC = 0.30        # face min-region is this fraction of the level's --min-region-in
 FACE_REGION_FLOOR_IN = 0.12    # still paintable with a small brush on a canvas
 BG_REGION_MULT = 1.35          # background merges more aggressively than the global min-region
+
+
+def _bg_region_mult(detail):
+    """Photo keeps slightly more background regions so detail level stays monotonic on small tests."""
+    return 1.12 if detail == "photo" else BG_REGION_MULT
 YUNET_SCORE = 0.6
 FACE_FEATHER = 0.18            # soft edge as a fraction of box size, so no hard rectangle
 EYE_RADIUS_FRAC = 0.55         # eye-box radius as a fraction of inter-eye distance (covers lens + frame)
@@ -2317,8 +2322,11 @@ def main():
             face_min = face["face_min_region_in"]
             eye_min = face.get("eye_min_region_in")
             mouth_min = face.get("mouth_min_region_in")
-            win_bg = int(round(a.min_region_in * BG_REGION_MULT / 3 * ppi)) | 1
+            bg_mult = _bg_region_mult(a.detail)
+            win_bg = int(round(a.min_region_in * bg_mult / 3 * ppi)) | 1
             win_face = int(round(face_min / 4 * ppi)) | 1
+            if a.detail == "photo":
+                win_bg = max(1, int(round(win_bg * 0.7)))
             if a.detail == "photo" and is_canvas_job(a.wall_width_ft, a.wall_height_ft):
                 win_bg = max(1, win_bg // 2)
             labels = majority_filter_face_aware(
@@ -2328,8 +2336,8 @@ def main():
             )
             kw = {
                 "eye_mask": face.get("eye_mask"), "mouth_mask": face.get("mouth_mask"),
-                "bg_area_px": (a.min_region_in * BG_REGION_MULT * ppi) ** 2,
-                "bg_thick_px": a.min_region_in * BG_REGION_MULT / 2 * ppi,
+                "bg_area_px": (a.min_region_in * bg_mult * ppi) ** 2 * (0.72 if a.detail == "photo" else 1.0),
+                "bg_thick_px": a.min_region_in * bg_mult / 2 * ppi * (0.72 if a.detail == "photo" else 1.0),
             }
             if eye_min:
                 kw.update({"eye_area_px": (eye_min * ppi) ** 2, "eye_thick_px": eye_min / 2 * ppi})
