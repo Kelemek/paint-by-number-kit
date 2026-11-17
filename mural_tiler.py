@@ -2131,26 +2131,76 @@ def _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask=None, min_weigh
     return _best_face_sheet(layout, combined, k, min_weight=min_weight)
 
 
-def render_focal_sheet_crop(labels, palette, layout, job, box, eye_mask, mouth_mask, face_mask=None):
-    """Palette view of the mural sheet that best covers the focal region, cropped like previews."""
+def render_focal_sheet_crop(
+    job_dir,
+    layout,
+    job,
+    box,
+    eye_mask=None,
+    mouth_mask=None,
+    face_mask=None,
+    dpi=144,
+):
+    """Rasterize full-build sheet PDF page(s) and crop the same work-pixel bbox as preview columns."""
     if box is None:
         return None
-    k = job["scale"] / job["ppi"]
-    pick = _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask)
-    if not pick:
+    job_dir = Path(job_dir)
+    pdf = ensure_full_mural_pdf(job_dir)
+    if pdf is None:
         return None
-    _r, _c, _area = pick
-    wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, _r, _c, k)
     x0, y0, x1, y1 = (int(v) for v in box)
-    ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
-    ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
-    if ix1 <= ix0 or iy1 <= iy0:
+    out_w, out_h = max(1, x1 - x0), max(1, y1 - y0)
+    k = job["scale"] / job["ppi"]
+    hits = _sheets_intersecting_box(layout, k, box)
+    if not hits:
+        pick = _best_focal_sheet(layout, k, eye_mask, mouth_mask, face_mask)
+        if not pick:
+            return None
+        r, c, _ = pick
+        wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+        ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
+        ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
+        hits = [(0, r, c, ix0, iy0, ix1, iy1)]
+    covered = 0.0
+    box_area = float((x1 - x0) * (y1 - y0))
+    pick_sheets = []
+    for item in hits:
+        pick_sheets.append(item)
+        covered += item[0]
+        if covered >= 0.92 * box_area or len(pick_sheets) >= 2:
+            break
+    if not pick_sheets:
+        pick_sheets = [hits[0]]
+    front_pages = _front_pages_for_full_build(job_dir)
+    canvas = np.full((out_h, out_w, 3), 245, np.uint8)
+    page_cache = {}
+    for _area, r, c, ix0, iy0, ix1, iy1 in pick_sheets:
+        page_num = _sheet_pdf_page(front_pages, layout, r, c)
+        if page_num not in page_cache:
+            img = rasterize_pdf_page(pdf, page_num, dpi=dpi)
+            if img is None:
+                continue
+            page_cache[page_num] = np.asarray(img)
+        page = page_cache[page_num]
+        ph, pw = page.shape[:2]
+        xa0, ya0 = _work_px_to_page_px(ix0, iy0, r, c, layout, job, dpi)
+        xa1, ya1 = _work_px_to_page_px(ix1, iy1, r, c, layout, job, dpi)
+        px0, px1 = int(round(min(xa0, xa1))), int(round(max(xa0, xa1)))
+        py0, py1 = int(round(min(ya0, ya1))), int(round(max(ya0, ya1)))
+        px0, py0 = max(0, px0), max(0, py0)
+        px1, py1 = min(pw, px1), min(ph, py1)
+        if px1 <= px0 or py1 <= py0:
+            continue
+        tile = page[py0:py1, px0:px1]
+        ox, oy = ix0 - x0, iy0 - y0
+        th, tw = tile.shape[:2]
+        y1p, x1p = min(out_h, oy + th), min(out_w, ox + tw)
+        if y1p <= oy or x1p <= ox:
+            continue
+        canvas[oy:y1p, ox:x1p] = tile[: y1p - oy, : x1p - ox]
+    if np.all(canvas == 245):
         return None
-    tint = float(job.get("sheet_tint", 0))
-    tile = palette[labels[iy0:iy1, ix0:ix1]].astype(np.float64)
-    if tint > 0:
-        tile = np.clip(255.0 * (1 - tint) + tile * tint, 0, 255)
-    return np.rint(tile).astype(np.uint8)
+    return canvas
 
 
 def _best_face_sheet(layout, face_mask, k, min_weight=1.0):
@@ -2229,6 +2279,114 @@ def build_preview_kit_pdf(path, job, small, palette, areas, brand_map, layout, m
                    palette_arr, style, face_mask=face_mask, eye_mask=eye_mask, mouth_mask=mouth_mask)
     cv.save()
     return cover_pages
+
+
+def ensure_full_mural_pdf(job_dir, tiler_path=None):
+    """Run --from-preview into job_dir/full so mural.pdf contains every numbered sheet."""
+    job_dir = Path(job_dir)
+    full = job_dir / "full"
+    pdf = full / "mural.pdf"
+    if pdf.is_file():
+        return pdf
+    tiler = Path(tiler_path or Path(__file__).resolve())
+    full.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [__import__("sys").executable, str(tiler), "--from-preview", str(job_dir), "--out", str(full)],
+        check=True,
+        cwd=str(tiler.parent),
+    )
+    return pdf if pdf.is_file() else None
+
+
+def rasterize_pdf_page(pdf_path, page_num, dpi=144):
+    """Rasterize one 1-based PDF page to an RGB PIL image; None if pdftoppm missing."""
+    pdf_path = Path(pdf_path)
+    if not pdf_path.is_file() or shutil.which("pdftoppm") is None:
+        return None
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        prefix = Path(td) / "page"
+        try:
+            subprocess.run(
+                [
+                    "pdftoppm",
+                    "-png",
+                    "-r",
+                    str(dpi),
+                    "-f",
+                    str(page_num),
+                    "-l",
+                    str(page_num),
+                    str(pdf_path),
+                    str(prefix),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            return None
+        hits = sorted(Path(td).glob("page-*.png"))
+        if not hits:
+            return None
+        return Image.open(hits[0]).convert("RGB")
+
+
+def _front_pages_for_full_build(job_dir):
+    pa = Path(job_dir) / "full" / "paint_areas.json"
+    if pa.is_file():
+        return int(json.loads(pa.read_text()).get("front_pages", 2))
+    return 2
+
+
+def _sheet_pdf_page(front_pages, layout, r, c):
+    return front_pages + r * layout.cols + c + 1
+
+
+def _focal_box_from_masks(eye_mask, mouth_mask, shape, pad=0.15):
+    m = np.zeros(shape[:2], dtype=bool)
+    if eye_mask is not None:
+        m |= eye_mask >= 0.35
+    if mouth_mask is not None:
+        m |= mouth_mask >= 0.35
+    if not np.any(m):
+        return None
+    ys, xs = np.nonzero(m)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    dx, dy = int((x1 - x0) * pad), int((y1 - y0) * pad)
+    h, w = shape[:2]
+    return max(0, x0 - dx), max(0, y0 - dy), min(w, x1 + dx), min(h, y1 + dy)
+
+
+def _work_px_to_page_px(px, py, r, c, layout, job, dpi):
+    """Map work-image pixel (x right, y down) to rasterized sheet page pixel (origin top-left)."""
+    k = job["scale"] / job["ppi"]
+    sx0, sy0 = c * layout.step_x, r * layout.step_y
+    left_pt = MARGIN * PT
+    bottom_pt = (MARGIN + FOOTER) * PT
+    top_pt = bottom_pt + layout.ch * PT
+    page_h_pt = layout.page_h * PT
+    page_x_pt = left_pt + (px * k - sx0) * PT
+    page_y_pt = top_pt - (py * k - sy0) * PT
+    scale = dpi / PT
+    return page_x_pt * scale, (page_h_pt - page_y_pt) * scale
+
+
+def _sheets_intersecting_box(layout, k, box):
+    x0, y0, x1, y1 = (int(v) for v in box)
+    hits = []
+    for r in range(layout.rows):
+        for c in range(layout.cols):
+            wx0, wy0, wx1, wy1 = _sheet_work_rect(layout, r, c, k)
+            ix0, iy0 = max(x0, int(math.floor(wx0))), max(y0, int(math.floor(wy0)))
+            ix1, iy1 = min(x1, int(math.ceil(wx1))), min(y1, int(math.ceil(wy1)))
+            area = _rect_intersection_area(x0, y0, x1, y1, wx0, wy0, wx1, wy1)
+            if area > 0 and ix1 > ix0 and iy1 > iy0:
+                hits.append((area, r, c, ix0, iy0, ix1, iy1))
+    hits.sort(key=lambda t: t[0], reverse=True)
+    return hits
 
 
 def rasterize_pdf_pages(pdf_path, out_dir, dpi=120):

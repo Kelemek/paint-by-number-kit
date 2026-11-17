@@ -154,7 +154,7 @@ def analyze_dir(job_dir: Path, tag: str):
     sk = skin_mask(face_mask, eye_mask, mouth_mask, labels.shape)
     lm = meta["label_metrics"]
     box = focal_bbox(face)
-    sheet = render_focal_sheet_crop(labels, palette, layout, job, box, eye_mask, mouth_mask, face_mask)
+    sheet = render_focal_sheet_crop(job_dir, layout, job, box, eye_mask, mouth_mask, face_mask)
     row = {
         "tag": tag,
         "detail": meta["detail"],
@@ -288,7 +288,7 @@ def main():
     quality_failed = False
     for level in LEVELS:
         tag = f"{level}_wall"
-        fails = audit_job(after_root / tag)
+        fails = audit_job(after_root / tag, check_sheet_crop=True)
         if fails:
             quality_failed = True
             print(f"QUALITY FAIL {tag}: {fails}")

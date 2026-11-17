@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -14,8 +15,11 @@ sys.path.insert(0, str(ROOT))
 from mural_tiler import (  # noqa: E402
     LABELS_ARCHIVE,
     PREVIEW_JOB_NAME,
+    _focal_box_from_masks,
     apply_image_prep,
+    choose_layout,
     fit_to_wall,
+    render_focal_sheet_crop,
     rgb_to_lab,
 )
 
@@ -100,6 +104,45 @@ def check_monolithic_focal(
     return True, top_frac
 
 
+def _digitish_blobs(gray, region):
+    blob = ((gray < 110) & region).astype(np.int32)
+    labels_cc, nlab = ndimage.label(blob)
+    count = 0
+    for lid in range(1, int(nlab) + 1):
+        area = int((labels_cc == lid).sum())
+        if 12 <= area <= 2500:
+            count += 1
+    return count
+
+
+def check_focal_sheet_crop(crop, eye_mask, box, mouth_mask=None):
+    """Sheet column must show real PDF linework and number-like strokes in the eye area."""
+    if crop is None or crop.size == 0:
+        return ["missing focal sheet crop"]
+    fails = []
+    gray = np.dot(crop[..., :3], [0.299, 0.587, 0.114]).astype(np.float32)
+    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    edge_px = int(((gx + gy) > 14).sum())
+    if edge_px < 120:
+        fails.append(f"sheet crop lacks outlines ({edge_px} edge px)")
+    if box is not None:
+        x0, y0, x1, y1 = (int(v) for v in box)
+        region = np.ones(gray.shape, dtype=bool)
+        if eye_mask is not None or mouth_mask is not None:
+            region = np.zeros(gray.shape, dtype=bool)
+            if eye_mask is not None:
+                region |= eye_mask[y0:y1, x0:x1] >= 0.35
+            if mouth_mask is not None:
+                region |= mouth_mask[y0:y1, x0:x1] >= 0.35
+            if np.any(region):
+                region = ndimage.binary_dilation(region, iterations=16)
+        digits = _digitish_blobs(gray, region)
+        if digits < 1:
+            fails.append("no number-like strokes in eye sheet crop")
+    return fails
+
+
 def check_l_tolerance(orig_stats, prev_stats, tol=L_TOLERANCE):
     if not orig_stats or not prev_stats:
         return True, None
@@ -107,7 +150,7 @@ def check_l_tolerance(orig_stats, prev_stats, tol=L_TOLERANCE):
     return abs(err) <= tol, err
 
 
-def audit_job(job_dir: Path):
+def audit_job(job_dir: Path, check_sheet_crop=False):
     meta, rgb, prev, labels, palette, face_mask, eye_mask, mouth_mask, scale, w_in, h_in = load_context(job_dir)
     eye_o = _zone_l(rgb, eye_mask)
     mouth_o = _zone_l(rgb, mouth_mask)
@@ -147,6 +190,17 @@ def audit_job(job_dir: Path):
         )
         if not ok:
             failures.append(f"eye monolithic label {frac:.0%} of mask")
+    if check_sheet_crop and eye_mask is not None and np.any(eye_mask >= 0.2):
+        overlap = float(meta.get("argv", {}).get("overlap_in") or 0.5)
+        layout = choose_layout(w_in * scale, h_in * scale, overlap)
+        job = {
+            "scale": scale,
+            "ppi": float(meta["ppi"]),
+            "sheet_tint": float(meta.get("argv", {}).get("sheet_tint", 0)),
+        }
+        box = _focal_box_from_masks(eye_mask, mouth_mask, labels.shape)
+        crop = render_focal_sheet_crop(job_dir, layout, job, box, eye_mask, mouth_mask, face_mask)
+        failures.extend(check_focal_sheet_crop(crop, eye_mask, box, mouth_mask))
     return failures
 
 

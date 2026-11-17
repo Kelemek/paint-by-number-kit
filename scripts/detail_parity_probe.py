@@ -85,7 +85,7 @@ def main():
             if FACE and name == "wall":
                 from scripts.focal_quality import audit_job
 
-                fq = audit_job(base)
+                fq = audit_job(base, check_sheet_crop=True)
                 if fq:
                     failed_mono = True
                     print(f"  FOCAL_QUALITY FAIL: {fq}")
